@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import requests
 from datetime import datetime
 import plotly.express as px
 
@@ -20,7 +19,7 @@ df_cir = None
 data_loaded = False
 
 if data_source == "Upload Files":
-    resource_file = st.sidebar.file_uploader("Resource Data ", type=['xlsx'])
+    resource_file = st.sidebar.file_uploader("Resource Data (header row 1)", type=['xlsx'])
     circle_file = st.sidebar.file_uploader("Circle Wise Data", type=['xlsx'])
     
     if resource_file and circle_file:
@@ -82,6 +81,11 @@ if data_loaded:
     col4.metric("Active Accounts", num_accounts)
     
     # ===== MTD / QTD / YTD SECTION =====
+    ytd_rev = ytd_gp = ytd_gpm = 0
+    qtd_rev = qtd_gp = qtd_gpm = 0
+    mtd_rev = mtd_gp = mtd_gpm = 0
+    mom_growth = 0
+    
     if not df_hist.empty:
         st.divider()
         st.subheader("📈 Period Comparisons")
@@ -170,7 +174,7 @@ if data_loaded:
         fig2 = px.bar(by_acct, title='Top 10 Accounts', labels={'value': 'Revenue ($M)'})
         st.plotly_chart(fig2, use_container_width=True)
     
-    # ===== NLP AGENT =====
+    # ===== NLP AGENT (Groq) =====
     st.divider()
     st.subheader("💬 Ask Questions")
     
@@ -181,11 +185,7 @@ if data_loaded:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
     
-    # Initialize YTD/QTD/MTD defaults
-ytd_rev = ytd_gp = qtd_rev = qtd_gp = mtd_rev = mtd_gp = mom_growth = 0
-ytd_gpm = qtd_gpm = mtd_gpm = 0
-
-if prompt := st.chat_input("Ask about revenue, accounts, regions, MTD/QTD/YTD..."):
+    if prompt := st.chat_input("Ask about revenue, accounts, regions, MTD/QTD/YTD..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -216,22 +216,30 @@ YTD SUMMARY:
 - MTD Revenue: ${mtd_rev:.3f}M (GPM: {mtd_gpm:.2f}%, Growth: {mom_growth:+.1f}% MoM)
 """
                     
-                    payload = {
-                        "model": "mistral",
-                        "prompt": f"{context}\n\nQuestion: {prompt}\n\nProvide a concise, data-driven answer.\n\nAnswer:",
-                        "stream": False
-                    }
-                    resp = requests.post("http://localhost:11434/api/generate", json=payload, timeout=60)
+                    groq_api_key = st.secrets.get("groq", {}).get("api_key")
                     
-                    if resp.status_code == 200:
-                        answer = resp.json().get('response', 'No response')
+                    if not groq_api_key:
+                        st.error("❌ Groq API key not configured. Add to Streamlit Cloud Secrets.")
+                    else:
+                        from groq import Groq
+                        
+                        client = Groq(api_key=groq_api_key)
+                        
+                        response = client.chat.completions.create(
+                            messages=[
+                                {"role": "system", "content": f"You are a portfolio analysis assistant. Answer concisely based on this data: {context}"},
+                                {"role": "user", "content": prompt}
+                            ],
+                            model="mixtral-8x7b-32768",
+                            max_tokens=500,
+                        )
+                        
+                        answer = response.choices[0].message.content
                         st.session_state.messages.append({"role": "assistant", "content": answer})
                         st.markdown(answer)
-                    else:
-                        st.error("Ollama error")
+                        
                 except Exception as e:
                     st.error(f"Error: {str(e)}")
-                    st.info("Ensure `ollama serve` is running on localhost:11434")
 
 else:
     st.info("📁 Upload Excel files or configure OneDrive in secrets.toml")
