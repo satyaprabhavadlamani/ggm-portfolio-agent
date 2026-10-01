@@ -9,6 +9,13 @@ st.title("📊 GGM D&I Portfolio Agent")
 # ===== CONFIGURATION =====
 GGM_CIRCLE = 'Data and Insights'
 
+# ===== GROQ MODEL FALLBACK =====
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",    # Best reasoning (current preferred)
+    "openai/gpt-oss-120b",         # High capability fallback
+    "gemma2-9b-it",                # Lightweight fallback
+]
+
 # ===== UTILITY FUNCTIONS =====
 def get_available_metrics(df_cir, df_res):
     """Dynamically identify available metrics"""
@@ -109,6 +116,28 @@ def suggest_questions(df_cir):
         suggestions.append("Show revenue by month")
     
     return suggestions
+
+def get_groq_response(client, messages, max_attempts=3):
+    """Try to get Groq response with model fallback"""
+    last_error = None
+    
+    for attempt, model in enumerate(GROQ_MODELS[:max_attempts]):
+        try:
+            st.write(f"🤔 Using model: {model}")
+            response = client.chat.completions.create(
+                messages=messages,
+                model=model,
+                max_tokens=500,
+            )
+            st.success(f"✅ Response from {model}")
+            return response.choices[0].message.content
+        except Exception as e:
+            last_error = str(e)
+            st.warning(f"⚠️ {model} failed: {last_error[:100]}")
+            continue
+    
+    # All models failed
+    raise Exception(f"All Groq models failed. Last error: {last_error}")
 
 # ===== LOAD CURRENT MONTH DATA =====
 st.sidebar.header("📁 Data Source")
@@ -333,21 +362,21 @@ if data_loaded:
                         
                         client = Groq(api_key=groq_api_key)
                         
-                        response = client.chat.completions.create(
-                            messages=[
+                        try:
+                            messages = [
                                 {
                                     "role": "system",
                                     "content": f"You are a portfolio analysis expert. Answer questions based on this data:\n\n{dynamic_context}"
                                 },
                                 {"role": "user", "content": prompt}
-                            ],
-                            model="llama-3-70b-versatile",
-                            max_tokens=500,
-                        )
-                        
-                        answer = response.choices[0].message.content
-                        st.session_state.messages.append({"role": "assistant", "content": answer})
-                        st.markdown(answer)
+                            ]
+                            
+                            answer = get_groq_response(client, messages)
+                            st.session_state.messages.append({"role": "assistant", "content": answer})
+                            st.markdown(answer)
+                            
+                        except Exception as e:
+                            st.error(f"❌ Model error: {str(e)}")
                         
                 except Exception as e:
                     st.error(f"Error: {str(e)}")
