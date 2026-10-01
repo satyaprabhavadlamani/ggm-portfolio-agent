@@ -181,7 +181,11 @@ if data_loaded:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
     
-    if prompt := st.chat_input("Ask about revenue, accounts, regions, MTD/QTD/YTD..."):
+    # Initialize YTD/QTD/MTD defaults
+ytd_rev = ytd_gp = qtd_rev = qtd_gp = mtd_rev = mtd_gp = mom_growth = 0
+ytd_gpm = qtd_gpm = mtd_gpm = 0
+
+if prompt := st.chat_input("Ask about revenue, accounts, regions, MTD/QTD/YTD..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
