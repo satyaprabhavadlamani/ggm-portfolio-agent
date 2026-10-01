@@ -30,10 +30,11 @@ def get_available_metrics(df_cir, df_res):
     if 'GP USD m' in df_cir.columns:
         metrics['profit'] = df_cir['GP USD m'].sum()
     
-    if 'GPM' in df_cir.columns:
-        metrics['gpm'] = df_cir['GPM'].mean()
-    elif metrics.get('revenue') and metrics.get('profit'):
+    # Calculate GPM = (Gross Profit / Revenue) * 100
+    if metrics.get('revenue') and metrics.get('revenue') > 0:
         metrics['gpm'] = (metrics['profit'] / metrics['revenue'] * 100)
+    else:
+        metrics['gpm'] = 0
     
     # Headcount from resource file - total employee count
     if df_res is not None and len(df_res) > 0:
@@ -52,7 +53,11 @@ def get_available_metrics(df_cir, df_res):
         metrics['headcount'] = 0
         metrics['active'] = 0
     
-    metrics['accounts'] = df_cir['Client'].nunique() if 'Client' in df_cir.columns else 0
+    # Accounts = distinct clients from Resource file
+    if df_res is not None and 'Client Name' in df_res.columns:
+        metrics['accounts'] = df_res['Client Name'].nunique()
+    else:
+        metrics['accounts'] = 0
     
     return metrics
 
