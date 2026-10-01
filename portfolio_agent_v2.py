@@ -7,7 +7,6 @@ st.set_page_config(page_title="GGM D&I Portfolio Agent", layout="wide")
 st.title("📊 GGM D&I Portfolio Agent")
 
 # ===== CONFIGURATION =====
-# Remove hardcoded filters - use actual data
 GGM_CIRCLE = 'Data and Insights'
 
 # ===== UTILITY FUNCTIONS =====
@@ -29,7 +28,23 @@ def get_available_metrics(df_cir, df_res):
     elif metrics.get('revenue') and metrics.get('profit'):
         metrics['gpm'] = (metrics['profit'] / metrics['revenue'] * 100)
     
-    metrics['headcount'] = len(df_res) if df_res is not None else 0
+    # Headcount from resource file - total employee count
+    if df_res is not None and len(df_res) > 0:
+        metrics['headcount'] = len(df_res)
+        
+        # Active employees - excluding benched and terminated
+        active = df_res.copy()
+        # Exclude benched
+        if 'Bench Resource' in active.columns:
+            active = active[active['Bench Resource'] != 'Y']
+        # Exclude terminated (has attrition date)
+        if 'AttritionDate' in active.columns:
+            active = active[active['AttritionDate'].isna()]
+        metrics['active'] = len(active)
+    else:
+        metrics['headcount'] = 0
+        metrics['active'] = 0
+    
     metrics['accounts'] = df_cir['Client'].nunique() if 'Client' in df_cir.columns else 0
     
     return metrics
@@ -48,7 +63,9 @@ def generate_dynamic_context(df_cir, df_res, metrics):
     if 'gpm' in metrics:
         context_lines.append(f"- Profit Margin: {metrics['gpm']:.2f}%")
     if metrics.get('headcount'):
-        context_lines.append(f"- Headcount: {metrics['headcount']}")
+        context_lines.append(f"- Total Headcount: {metrics['headcount']}")
+    if metrics.get('active'):
+        context_lines.append(f"- Active Employees: {metrics['active']} (excl. benched & terminated)")
     if metrics.get('accounts'):
         context_lines.append(f"- Active Accounts: {metrics['accounts']}")
     
@@ -168,11 +185,12 @@ if data_loaded:
     # Get metrics dynamically
     metrics = get_available_metrics(df_cir, df_res)
     
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Current Revenue", f"${metrics.get('revenue', 0):.3f}M")
-    col2.metric("Profit Margin", f"{metrics.get('gpm', 0):.2f}%")
-    col3.metric("Headcount", metrics.get('headcount', 0))
-    col4.metric("Active Accounts", metrics.get('accounts', 0))
+    col2.metric("Gross Profit (GP)", f"${metrics.get('profit', 0):.3f}M", f"GPM: {metrics.get('gpm', 0):.2f}%")
+    col3.metric("Headcount", metrics.get('headcount', 0), "Total employees")
+    col4.metric("Active", metrics.get('active', 0), "Excl. benched/term.")
+    col5.metric("Accounts", metrics.get('accounts', 0))
     
     # ===== MTD / QTD / YTD SECTION =====
     ytd_rev = ytd_gp = ytd_gpm = 0
@@ -209,3 +227,130 @@ if data_loaded:
         
         # QTD
         qtd_data = df_hist[(df_hist['date'].dt.quarter == current_quarter) & (df_hist['date'].dt.year == current_year)]
+        qtd_rev = qtd_data['revenue_amount'].sum()
+        qtd_gp = qtd_data['gp_amount'].sum()
+        qtd_gpm = (qtd_gp / qtd_rev * 100) if qtd_rev > 0 else 0
+        
+        # YTD
+        ytd_data = df_hist[df_hist['date'].dt.year == current_year]
+        ytd_rev = ytd_data['revenue_amount'].sum()
+        ytd_gp = ytd_data['gp_amount'].sum()
+        ytd_gpm = (ytd_gp / ytd_rev * 100) if ytd_rev > 0 else 0
+        
+        # MoM comparison
+        prev_month_data = df_hist[(df_hist['date'].dt.month == current_month - 1) & (df_hist['date'].dt.year == current_year)]
+        prev_rev = prev_month_data['revenue_amount'].sum()
+        mom_growth = ((mtd_rev - prev_rev) / prev_rev * 100) if prev_rev > 0 else 0
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("MTD Revenue", f"${mtd_rev:.3f}M", f"{mom_growth:+.1f}% MoM")
+            st.metric("MTD GPM", f"{mtd_gpm:.2f}%")
+        
+        with col2:
+            st.metric("QTD Revenue", f"${qtd_rev:.3f}M")
+            st.metric("QTD GPM", f"{qtd_gpm:.2f}%")
+        
+        with col3:
+            st.metric("YTD Revenue", f"${ytd_rev:.3f}M")
+            st.metric("YTD GPM", f"{ytd_gpm:.2f}%")
+        
+        # Trend chart
+        monthly_trend = df_hist.groupby('date').agg({
+            'revenue_amount': 'sum',
+            'gp_amount': 'sum'
+        }).reset_index()
+        monthly_trend['gpm'] = (monthly_trend['gp_amount'] / monthly_trend['revenue_amount'] * 100).round(2)
+        monthly_trend = monthly_trend.sort_values('date')
+        
+        fig = px.line(monthly_trend, x='date', y='revenue_amount', 
+                     title='Revenue Trend (All Months)', markers=True,
+                     labels={'revenue_amount': 'Revenue ($M)', 'date': 'Month'})
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # ===== CURRENT MONTH BREAKDOWN =====
+    st.divider()
+    st.subheader("💼 Current Month Details")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if 'Region' in df_cir.columns and 'Revenue USD m' in df_cir.columns:
+            st.write("**Revenue by Region**")
+            by_reg = df_cir.groupby('Region')['Revenue USD m'].sum().sort_values(ascending=False)
+            fig1 = px.bar(by_reg, title='Revenue by Region', labels={'value': 'Revenue ($M)'})
+            st.plotly_chart(fig1, use_container_width=True)
+    
+    with col2:
+        if 'Client' in df_cir.columns and 'Revenue USD m' in df_cir.columns:
+            st.write("**Top 10 Accounts**")
+            by_acct = df_cir.groupby('Client')['Revenue USD m'].sum().sort_values(ascending=False).head(10)
+            fig2 = px.bar(by_acct, title='Top 10 Accounts', labels={'value': 'Revenue ($M)'})
+            st.plotly_chart(fig2, use_container_width=True)
+    
+    # ===== NLP AGENT (Groq) =====
+    st.divider()
+    st.subheader("💬 Ask Questions")
+    
+    # Show suggestions
+    with st.expander("💡 Suggested questions"):
+        suggestions = suggest_questions(df_cir)
+        for suggestion in suggestions:
+            st.write(f"• {suggestion}")
+    
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+    
+    if prompt := st.chat_input("Ask about revenue, accounts, regions, margins..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing..."):
+                try:
+                    # Generate dynamic context
+                    dynamic_context = generate_dynamic_context(df_cir, df_res, metrics)
+                    
+                    # Add historical context if available
+                    if not df_hist.empty:
+                        dynamic_context += f"\n\nHISTORICAL SUMMARY:\n"
+                        dynamic_context += f"- YTD Revenue: ${ytd_rev:.3f}M (GPM: {ytd_gpm:.2f}%)\n"
+                        dynamic_context += f"- QTD Revenue: ${qtd_rev:.3f}M (GPM: {qtd_gpm:.2f}%)\n"
+                        dynamic_context += f"- MTD Revenue: ${mtd_rev:.3f}M (GPM: {mtd_gpm:.2f}%, Growth: {mom_growth:+.1f}% MoM)"
+                    
+                    groq_api_key = st.secrets.get("groq", {}).get("api_key")
+                    
+                    if not groq_api_key:
+                        st.error("❌ Groq API key not configured.")
+                    else:
+                        from groq import Groq
+                        
+                        client = Groq(api_key=groq_api_key)
+                        
+                        response = client.chat.completions.create(
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": f"You are a portfolio analysis expert. Answer questions based on this data:\n\n{dynamic_context}"
+                                },
+                                {"role": "user", "content": prompt}
+                            ],
+                            model="llama-3-70b-versatile",
+                            max_tokens=500,
+                        )
+                        
+                        answer = response.choices[0].message.content
+                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                        st.markdown(answer)
+                        
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+
+else:
+    st.info("📁 Upload Circle Wise data to start")
