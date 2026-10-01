@@ -36,19 +36,11 @@ def get_available_metrics(df_cir, df_res):
     else:
         metrics['gpm'] = 0
     
-    # Headcount from resource file - total employee count
+    # Headcount & Active from resource file
+    # File contains ONLY active resources, so both counts are the same
     if df_res is not None and len(df_res) > 0:
         metrics['headcount'] = len(df_res)
-        
-        # Active employees - NOT benched AND NOT terminated
-        active = df_res.copy()
-        # Keep only if Bench Resource == 'No' (explicitly not benched)
-        if 'Bench Resource' in active.columns:
-            active = active[active['Bench Resource'] == 'No']
-        # Exclude terminated (no attrition date = not terminated)
-        if 'AttritionDate' in active.columns:
-            active = active[active['AttritionDate'].isna()]
-        metrics['active'] = len(active)
+        metrics['active'] = len(df_res)  # Same as headcount (file pre-filtered to active only)
     else:
         metrics['headcount'] = 0
         metrics['active'] = 0
@@ -75,11 +67,9 @@ def generate_dynamic_context(df_cir, df_res, metrics):
     if 'gpm' in metrics:
         context_lines.append(f"- Profit Margin: {metrics['gpm']:.2f}%")
     if metrics.get('headcount'):
-        context_lines.append(f"- Total Headcount: {metrics['headcount']}")
-    if metrics.get('active'):
-        context_lines.append(f"- Active Employees: {metrics['active']} (excl. benched & terminated)")
+        context_lines.append(f"- Headcount (Active): {metrics['headcount']}")
     if metrics.get('accounts'):
-        context_lines.append(f"- Active Accounts: {metrics['accounts']}")
+        context_lines.append(f"- Accounts: {metrics['accounts']}")
     
     context_lines.append("")
     
@@ -97,16 +87,10 @@ def generate_dynamic_context(df_cir, df_res, metrics):
         context_lines.append(by_reg.round(3).to_string())
         context_lines.append("")
     
-    # Headcount by client (for active employees only)
+    # Headcount by client (all rows are active)
     if df_res is not None and 'Client Name' in df_res.columns:
-        active_for_hc = df_res.copy()
-        # Filter to active only for this breakdown
-        if 'Bench Resource' in active_for_hc.columns:
-            active_for_hc = active_for_hc[active_for_hc['Bench Resource'] == 'No']
-        if 'AttritionDate' in active_for_hc.columns:
-            active_for_hc = active_for_hc[active_for_hc['AttritionDate'].isna()]
-        hc_by_client = active_for_hc.groupby('Client Name').size().sort_values(ascending=False).head(5)
-        context_lines.append("Top 5 Accounts by Headcount (Active):")
+        hc_by_client = df_res.groupby('Client Name').size().sort_values(ascending=False).head(5)
+        context_lines.append("Top 5 Accounts by Headcount:")
         context_lines.append(hc_by_client.to_string())
         context_lines.append("")
     
@@ -222,12 +206,11 @@ if data_loaded:
     # Get metrics dynamically
     metrics = get_available_metrics(df_cir, df_res)
     
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Current Revenue", f"${metrics.get('revenue', 0):.3f}M")
     col2.metric("Gross Profit (GP)", f"${metrics.get('profit', 0):.3f}M", f"GPM: {metrics.get('gpm', 0):.2f}%")
-    col3.metric("Headcount", metrics.get('headcount', 0), "Total employees")
-    col4.metric("Active", metrics.get('active', 0), "Excl. benched/term.")
-    col5.metric("Accounts", metrics.get('accounts', 0))
+    col3.metric("Headcount", metrics.get('headcount', 0), "Active employees")
+    col4.metric("Accounts", metrics.get('accounts', 0))
     
     # ===== MTD / QTD / YTD SECTION =====
     ytd_rev = ytd_gp = ytd_gpm = 0
