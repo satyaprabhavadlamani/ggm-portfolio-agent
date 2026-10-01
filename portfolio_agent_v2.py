@@ -39,12 +39,12 @@ def get_available_metrics(df_cir, df_res):
     if df_res is not None and len(df_res) > 0:
         metrics['headcount'] = len(df_res)
         
-        # Active employees - excluding benched and terminated
+        # Active employees - NOT benched AND NOT terminated
         active = df_res.copy()
-        # Exclude benched
+        # Keep only if Bench Resource == 'No' (explicitly not benched)
         if 'Bench Resource' in active.columns:
-            active = active[active['Bench Resource'] != 'Y']
-        # Exclude terminated (has attrition date)
+            active = active[active['Bench Resource'] == 'No']
+        # Exclude terminated (no attrition date = not terminated)
         if 'AttritionDate' in active.columns:
             active = active[active['AttritionDate'].isna()]
         metrics['active'] = len(active)
@@ -92,10 +92,16 @@ def generate_dynamic_context(df_cir, df_res, metrics):
         context_lines.append(by_reg.round(3).to_string())
         context_lines.append("")
     
-    # Headcount by client
+    # Headcount by client (for active employees only)
     if df_res is not None and 'Client Name' in df_res.columns:
-        hc_by_client = df_res.groupby('Client Name').size().sort_values(ascending=False).head(5)
-        context_lines.append("Top 5 Accounts by Headcount:")
+        active_for_hc = df_res.copy()
+        # Filter to active only for this breakdown
+        if 'Bench Resource' in active_for_hc.columns:
+            active_for_hc = active_for_hc[active_for_hc['Bench Resource'] == 'No']
+        if 'AttritionDate' in active_for_hc.columns:
+            active_for_hc = active_for_hc[active_for_hc['AttritionDate'].isna()]
+        hc_by_client = active_for_hc.groupby('Client Name').size().sort_values(ascending=False).head(5)
+        context_lines.append("Top 5 Accounts by Headcount (Active):")
         context_lines.append(hc_by_client.to_string())
         context_lines.append("")
     
@@ -165,12 +171,9 @@ if data_source == "Upload Files":
             # Load resource data if provided
             if resource_file:
                 df_res = pd.read_excel(resource_file, sheet_name=0, header=0)
-                # Filter if needed
-                if 'Practices' in df_res.columns and 'Region' in df_res.columns:
+                # Filter by Practices (all should be 'Data and Insights' already)
+                if 'Practices' in df_res.columns:
                     df_res = df_res[df_res['Practices'] == 'Data and Insights']
-                    # Get regions from Circle data
-                    valid_regions = df_cir['Region'].unique() if 'Region' in df_cir.columns else []
-                    df_res = df_res[df_res['Region'].isin(valid_regions)]
                 st.sidebar.write(f"📊 Loaded {len(df_res)} resources")
             
             data_loaded = len(df_cir) > 0
