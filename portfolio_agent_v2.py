@@ -230,7 +230,7 @@ YTD SUMMARY:
                                 {"role": "system", "content": f"You are a portfolio analysis assistant. Answer concisely based on this data: {context}"},
                                 {"role": "user", "content": prompt}
                             ],
-                           model="llama-2-70b-chat",
+                           model="gemma-7b-it",
                             max_tokens=500,
                         )
                         
