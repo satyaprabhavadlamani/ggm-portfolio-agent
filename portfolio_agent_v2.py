@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from datetime import datetime
 import plotly.express as px
 from difflib import SequenceMatcher
@@ -9,6 +10,22 @@ st.title("📊 GGM D&I Portfolio Agent")
 
 # ===== CONFIGURATION =====
 GGM_CIRCLE = 'Data and Insights'
+
+# ===== MONTH ORDERING (Calendar, not alphabetical) =====
+MONTH_ORDER = {
+    'Jan': 1, 'January': 1,
+    'Feb': 2, 'February': 2,
+    'Mar': 3, 'March': 3,
+    'Apr': 4, 'April': 4,
+    'May': 5,
+    'Jun': 6, 'June': 6,
+    'Jul': 7, 'July': 7,
+    'Aug': 8, 'August': 8,
+    'Sep': 9, 'September': 9,
+    'Oct': 10, 'October': 10,
+    'Nov': 11, 'November': 11,
+    'Dec': 12, 'December': 12,
+}
 
 # ===== GROQ MODEL FALLBACK =====
 GROQ_MODELS = [
@@ -65,6 +82,12 @@ def expand_synonyms(text):
     return expanded_context if expanded_context != "\n[SYNONYM CONTEXT]: " else ""
 
 # ===== UTILITY FUNCTIONS =====
+
+def sort_months_calendar_order(months):
+    """Sort months in calendar order (Jan -> Dec), not alphabetically"""
+    if isinstance(months, np.ndarray):
+        months = list(months)
+    return sorted(months, key=lambda m: MONTH_ORDER.get(m, 99))
 
 def fuzzy_match_client(user_text, df_res):
     """Find matching client names from user query using fuzzy matching"""
@@ -137,7 +160,8 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw=None, selected_
     
     # Add historical context if available
     if df_cir_raw is not None and 'Month' in df_cir_raw.columns:
-        available_months = sorted(df_cir_raw['Month'].unique())
+        # Sort in calendar order (Jan->Dec), not alphabetically!
+        available_months = sort_months_calendar_order(df_cir_raw['Month'].unique())
         context_lines.append(f"📅 DATASET CONTAINS {len(available_months)} MONTHS OF HISTORICAL DATA:")
         context_lines.append(f"   Available months: {', '.join(map(str, available_months))}")
         context_lines.append(f"   Currently analyzing: {selected_month if selected_month else 'Latest month'}")
@@ -148,7 +172,7 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw=None, selected_
             if selected_month in available_months_list:
                 idx = available_months_list.index(selected_month)
                 if idx > 0:
-                    prev_month = available_months_list[idx - 1]
+                    prev_month = available_months_list[idx - 1]  # Previous in calendar order
                     context_lines.append(f"   Can compare to: {prev_month} (previous month)")
         context_lines.append("")
     
@@ -250,9 +274,12 @@ def suggest_questions(df_cir):
     return suggestions
 
 def resolve_month_reference(user_query, available_months):
-    """Convert month references in user query to actual month values"""
+    """Convert month references in user query to actual month values (in calendar order)"""
     if not available_months:
         return None
+    
+    # Sort available months in calendar order (not alphabetically)
+    available_months_sorted = sort_months_calendar_order(available_months)
     
     month_mapping = {
         'jan': 'Jan', 'january': 'Jan',
@@ -273,35 +300,41 @@ def resolve_month_reference(user_query, available_months):
     
     # Check for specific month names
     for key, month_val in month_mapping.items():
-        if key in query_lower and month_val in available_months:
+        if key in query_lower and month_val in available_months_sorted:
             return month_val
     
-    # Check for "last month"
-    if 'last month' in query_lower and len(available_months) > 1:
-        return available_months[-2]  # Second to last
+    # Check for "last month" - get previous month in calendar order
+    if 'last month' in query_lower and len(available_months_sorted) > 1:
+        return available_months_sorted[-2]  # Second to last in calendar order
     
     # Check for "previous month"
-    if 'previous month' in query_lower and len(available_months) > 1:
-        return available_months[-2]
+    if 'previous month' in query_lower and len(available_months_sorted) > 1:
+        return available_months_sorted[-2]
     
     # Check for "this month" or "current month"
     if 'this month' in query_lower or 'current month' in query_lower:
-        return available_months[-1]  # Latest month
+        return available_months_sorted[-1]  # Latest month in calendar order
     
     return None
 
 def get_month_comparison(df_cir_raw, current_month, prev_month_name=None):
-    """Calculate previous month comparison for trend analysis"""
+    """Calculate previous month comparison for trend analysis (calendar order)"""
     if df_cir_raw is None or 'Month' not in df_cir_raw.columns:
         return None
     
-    available_months = sorted(df_cir_raw['Month'].unique())
-    current_idx = available_months.index(current_month) if current_month in available_months else -1
+    # Sort in calendar order (Jan->Dec), NOT alphabetically!
+    available_months = sort_months_calendar_order(df_cir_raw['Month'].unique())
+    available_months = list(available_months)
+    
+    try:
+        current_idx = available_months.index(current_month)
+    except ValueError:
+        return None
     
     if current_idx <= 0:  # No previous month available
         return None
     
-    prev_month = available_months[current_idx - 1]
+    prev_month = available_months[current_idx - 1]  # Previous in calendar order
     
     # Filter by circle
     if 'Circle' in df_cir_raw.columns:
@@ -389,17 +422,18 @@ if data_source == "Upload Files":
             
             st.sidebar.write(f"📊 Loaded {len(df_cir_raw)} Circle Wise records")
             
-            # Detect available months
+            # Detect available months (in calendar order, not alphabetically!)
             available_months = []
             if 'Month' in df_cir_raw.columns:
-                available_months = sorted(df_cir_raw['Month'].unique())
-                st.sidebar.write(f"📅 Available months: {', '.join(map(str, available_months))}")
+                # Sort in calendar order (Jan->Dec), NOT alphabetically!
+                available_months = sort_months_calendar_order(df_cir_raw['Month'].unique())
+                st.sidebar.write(f"📅 Available months (calendar order): {', '.join(map(str, available_months))}")
                 
                 # Month selector
                 selected_month = st.sidebar.selectbox(
                     "Select month to analyze:",
                     options=available_months,
-                    index=len(available_months) - 1  # Default to latest month
+                    index=len(available_months) - 1  # Default to latest month (Dec if available)
                 )
                 st.sidebar.write(f"✅ Selected: {selected_month}")
             else:
