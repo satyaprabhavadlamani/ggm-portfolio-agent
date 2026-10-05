@@ -4,6 +4,7 @@ import numpy as np
 from datetime import datetime
 import plotly.express as px
 from difflib import SequenceMatcher
+from local_folder_loader import load_monthly_data_from_folder, get_available_months
 
 st.set_page_config(page_title="GGM D&I Portfolio Agent", layout="wide")
 st.title("📊 GGM D&I Portfolio Agent")
@@ -36,23 +37,26 @@ GROQ_MODELS = [
 
 # ===== EXECUTIVE SYNONYM MAPPING =====
 SYNONYM_MAP = {
-    'revenue': ['sales', 'top line', 'topline', 'income', 'earnings', 'throughput', 'business', 'volume'],
-    'revenue_amount': ['revenue', 'sales', 'top line', 'generated', 'brought in'],
-    'profit': ['gp', 'gross profit', 'margin', 'bottomline', 'bottom line', 'earnings', 'returns', 'benefit'],
-    'gp_amount': ['profit', 'gp', 'gross profit', 'gains'],
-    'gpm': ['margin', 'profitability', 'margin %', 'percentage', 'efficiency', 'returns', 'yield'],
-    'headcount': ['staff', 'team', 'people', 'employees', 'strength', 'bench', 'resources', 'workforce', 'fte'],
-    'headcount_amount': ['headcount', 'staff', 'people', 'team size', 'strength'],
-    'account': ['client', 'customer', 'partner', 'engagement', 'project', 'contract', 'business'],
-    'client_name': ['account', 'client', 'customer', 'project', 'engagement'],
-    'region': ['geography', 'location', 'zone', 'area', 'market', 'country', 'place'],
-    'mtd': ['month', 'current month', 'this month', 'monthly'],
-    'qtd': ['quarter', 'quarterly', 'this quarter', 'current quarter'],
-    'ytd': ['year', 'annual', 'yearly', 'this year', 'current year'],
-    'growth': ['increase', 'improvement', 'trend', 'change', 'momentum', 'uptick'],
-    'decline': ['decrease', 'drop', 'fall', 'downturn', 'reduction', 'dip'],
-    'top': ['best', 'largest', 'biggest', 'highest', 'leading', 'major'],
-    'bottom': ['worst', 'smallest', 'lowest', 'trailing', 'weakest'],
+    'revenue': ['sales', 'top line', 'topline', 'income', 'earnings', 'throughput', 'business', 'volume', 'billing', 'invoiced', 'billed'],
+    'revenue_amount': ['revenue', 'sales', 'top line', 'generated', 'brought in', 'total sales'],
+    'profit': ['gp', 'gross profit', 'margin', 'bottomline', 'bottom line', 'earnings', 'returns', 'benefit', 'gain', 'net'],
+    'gp_amount': ['profit', 'gp', 'gross profit', 'gains', 'profit amount'],
+    'gpm': ['margin', 'profitability', 'margin %', 'percentage', 'efficiency', 'returns', 'yield', 'margin percentage'],
+    'headcount': ['staff', 'team', 'people', 'employees', 'strength', 'bench', 'resources', 'workforce', 'fte', 'team size', 'personnel', 'manpower'],
+    'headcount_amount': ['headcount', 'staff', 'people', 'team size', 'strength', 'number of people'],
+    'account': ['client', 'customer', 'partner', 'engagement', 'project', 'contract', 'business', 'deal', 'opportunity'],
+    'client_name': ['account', 'client', 'customer', 'project', 'engagement', 'company', 'vendor'],
+    'region': ['geography', 'location', 'zone', 'area', 'market', 'country', 'place', 'territory'],
+    'cost': ['expense', 'cost of sales', 'cogs', 'operational cost', 'spending'],
+    'mtd': ['month', 'current month', 'this month', 'monthly', 'month to date'],
+    'qtd': ['quarter', 'quarterly', 'this quarter', 'current quarter', 'q1', 'q2', 'q3', 'q4'],
+    'ytd': ['year', 'annual', 'yearly', 'this year', 'current year', 'year to date'],
+    'growth': ['increase', 'improvement', 'trend', 'change', 'momentum', 'uptick', 'growth rate', 'expansion'],
+    'decline': ['decrease', 'drop', 'fall', 'downturn', 'reduction', 'dip', 'decline rate'],
+    'top': ['best', 'largest', 'biggest', 'highest', 'leading', 'major', 'top performing'],
+    'bottom': ['worst', 'smallest', 'lowest', 'trailing', 'weakest', 'bottom performing'],
+    'performance': ['how is', 'status', 'doing', 'outlook', 'trajectory', 'progress'],
+    'comparison': ['vs', 'versus', 'against', 'compared to', 'relative to'],
 }
 
 # ===== UTILITY FUNCTIONS =====
@@ -63,6 +67,89 @@ def sort_months_calendar_order(months):
         months = list(months)
     return sorted(months, key=lambda m: MONTH_ORDER.get(m, 99))
 
+def detect_column_mapping(df_cir, df_res):
+    """Intelligently detect and map column names from actual data"""
+    column_map = {
+        'revenue': None,
+        'cost': None,
+        'profit': None,
+        'gpm': None,
+        'client': None,
+        'region': None,
+        'circle': None,
+        'month': None,
+    }
+    
+    # Revenue column detection (multiple patterns)
+    for col in df_cir.columns:
+        col_lower = col.lower()
+        if any(term in col_lower for term in ['revenue', 'sales', 'topline', 'top_line', 'billing', 'invoiced']):
+            column_map['revenue'] = col
+            break
+    
+    # Cost/COGS detection
+    for col in df_cir.columns:
+        col_lower = col.lower()
+        if any(term in col_lower for term in ['cost', 'cogs', 'expense', 'operational cost']):
+            column_map['cost'] = col
+            break
+    
+    # Profit/GP detection
+    for col in df_cir.columns:
+        col_lower = col.lower()
+        if any(term in col_lower for term in ['gross profit', 'gp ', 'profit ', 'net profit', 'gain']):
+            column_map['profit'] = col
+            break
+    
+    # GPM/Margin detection
+    for col in df_cir.columns:
+        col_lower = col.lower()
+        if any(term in col_lower for term in ['margin', 'gpm', 'profitability', 'margin %']):
+            column_map['gpm'] = col
+            break
+    
+    # Client/Customer detection
+    for col in df_cir.columns:
+        col_lower = col.lower()
+        if any(term in col_lower for term in ['client', 'customer', 'account', 'company', 'vendor']):
+            column_map['client'] = col
+            break
+    
+    # Region detection
+    for col in df_cir.columns:
+        col_lower = col.lower()
+        if any(term in col_lower for term in ['region', 'geography', 'location', 'territory', 'zone']):
+            column_map['region'] = col
+            break
+    
+    # Circle/Practice detection
+    for col in df_cir.columns:
+        col_lower = col.lower()
+        if any(term in col_lower for term in ['circle', 'practice', 'business unit', 'bu']):
+            column_map['circle'] = col
+            break
+    
+    # Month detection
+    for col in df_cir.columns:
+        col_lower = col.lower()
+        if any(term in col_lower for term in ['month', 'period', 'date', 'time_period']):
+            column_map['month'] = col
+            break
+    
+    # Fallback to exact matches if not found
+    for key in ['revenue', 'cost', 'profit', 'gpm', 'client', 'region', 'circle', 'month']:
+        if column_map[key] is None:
+            if f'Revenue USD m' in df_cir.columns and key == 'revenue':
+                column_map['revenue'] = 'Revenue USD m'
+            elif f'Cost USD m' in df_cir.columns and key == 'cost':
+                column_map['cost'] = 'Cost USD m'
+            elif f'GP USD m' in df_cir.columns and key == 'profit':
+                column_map['profit'] = 'GP USD m'
+            elif f'Circle' in df_cir.columns and key == 'circle':
+                column_map['circle'] = 'Circle'
+    
+    return column_map
+
 def expand_synonyms(text):
     """Expand user query with synonym explanations for AI"""
     expanded_context = "\n[SYNONYM CONTEXT]: "
@@ -71,6 +158,23 @@ def expand_synonyms(text):
             if syn.lower() in text.lower():
                 expanded_context += f"'{syn}' = {main_term}; "
     return expanded_context if expanded_context != "\n[SYNONYM CONTEXT]: " else ""
+
+def get_column_explanations(column_map):
+    """Generate explanations for detected columns for AI context"""
+    explanations = []
+    if column_map.get('revenue'):
+        explanations.append(f"Revenue column: '{column_map['revenue']}'")
+    if column_map.get('cost'):
+        explanations.append(f"Cost column: '{column_map['cost']}'")
+    if column_map.get('profit'):
+        explanations.append(f"Profit column: '{column_map['profit']}'")
+    if column_map.get('gpm'):
+        explanations.append(f"Margin column: '{column_map['gpm']}'")
+    if column_map.get('client'):
+        explanations.append(f"Client/Account column: '{column_map['client']}'")
+    if column_map.get('region'):
+        explanations.append(f"Region column: '{column_map['region']}'")
+    return explanations
 
 def fuzzy_match_client(user_text, df_res):
     """Find matching client names from user query using fuzzy matching"""
@@ -99,24 +203,53 @@ def fuzzy_match_client(user_text, df_res):
     
     return updated_text
 
-def get_available_metrics(df_cir, df_res):
-    """Dynamically identify available metrics"""
+def get_available_metrics(df_cir, df_res, column_map=None):
+    """Dynamically identify available metrics using detected column names"""
     metrics = {}
     
-    if 'Revenue USD m' in df_cir.columns:
-        metrics['revenue'] = df_cir['Revenue USD m'].sum()
+    # Try to use column_map if provided, otherwise use standard column names
+    revenue_col = None
+    cost_col = None
+    profit_col = None
     
-    if 'Cost USD m' in df_cir.columns:
-        metrics['cost'] = df_cir['Cost USD m'].sum()
+    if column_map:
+        revenue_col = column_map.get('revenue')
+        cost_col = column_map.get('cost')
+        profit_col = column_map.get('profit')
     
-    if 'GP USD m' in df_cir.columns:
-        metrics['profit'] = df_cir['GP USD m'].sum()
+    # Fallback to standard names if not in column_map
+    if not revenue_col and 'Revenue USD m' in df_cir.columns:
+        revenue_col = 'Revenue USD m'
+    if not cost_col and 'Cost USD m' in df_cir.columns:
+        cost_col = 'Cost USD m'
+    if not profit_col and 'GP USD m' in df_cir.columns:
+        profit_col = 'GP USD m'
     
+    # Calculate metrics
+    if revenue_col and revenue_col in df_cir.columns:
+        metrics['revenue'] = df_cir[revenue_col].sum()
+    else:
+        metrics['revenue'] = 0
+    
+    if cost_col and cost_col in df_cir.columns:
+        metrics['cost'] = df_cir[cost_col].sum()
+    else:
+        metrics['cost'] = 0
+    
+    if profit_col and profit_col in df_cir.columns:
+        metrics['profit'] = df_cir[profit_col].sum()
+    elif metrics.get('revenue') and metrics.get('cost'):
+        metrics['profit'] = metrics['revenue'] - metrics['cost']
+    else:
+        metrics['profit'] = 0
+    
+    # Calculate GPM
     if metrics.get('revenue') and metrics.get('revenue') > 0:
         metrics['gpm'] = (metrics['profit'] / metrics['revenue'] * 100)
     else:
         metrics['gpm'] = 0
     
+    # Headcount
     if df_res is not None and len(df_res) > 0:
         metrics['headcount'] = len(df_res)
         metrics['active'] = len(df_res)
@@ -124,14 +257,21 @@ def get_available_metrics(df_cir, df_res):
         metrics['headcount'] = 0
         metrics['active'] = 0
     
-    if df_res is not None and 'Client Name' in df_res.columns:
+    # Accounts (try to detect client column)
+    client_col = column_map.get('client') if column_map else None
+    if not client_col and 'Client Name' in df_res.columns:
+        client_col = 'Client Name'
+    
+    if df_res is not None and client_col and client_col in df_res.columns:
+        metrics['accounts'] = df_res[client_col].nunique()
+    elif df_res is not None and 'Client Name' in df_res.columns:
         metrics['accounts'] = df_res['Client Name'].nunique()
     else:
         metrics['accounts'] = 0
     
     return metrics
 
-def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw=None, selected_month=None):
+def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw=None, selected_month=None, column_map=None):
     """Generate comprehensive executive-level context for AI"""
     context_lines = ["="*70, "PORTFOLIO INTELLIGENCE DASHBOARD", "="*70, ""]
     
@@ -139,9 +279,27 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw=None, selected_
     context_lines.append("📂 DATA FILE STRUCTURE & AVAILABILITY:")
     context_lines.append("   Source 1 - Circle Wise Financial Data (FINANCIAL METRICS):")
     context_lines.append("   • CONTAINS: All months Jan 2026 through Aug 2026 in single consolidated Excel sheet")
-    context_lines.append("   • METRICS: Revenue USD m, Cost USD m, GP USD m, GPM % for EACH month")
+    context_lines.append("   • METRICS: Available financial columns detected below")
     context_lines.append("   • STRUCTURE: One row per month-region-client combination")
     context_lines.append("")
+    
+    # Show detected columns
+    if column_map:
+        context_lines.append("📋 DETECTED COLUMNS IN DATA (VP may use different names):")
+        if column_map.get('revenue'):
+            context_lines.append(f"   • Revenue: '{column_map['revenue']}' (VP may say: sales, topline, income)")
+        if column_map.get('cost'):
+            context_lines.append(f"   • Cost: '{column_map['cost']}' (VP may say: expense, COGS, operational cost)")
+        if column_map.get('profit'):
+            context_lines.append(f"   • Profit: '{column_map['profit']}' (VP may say: GP, gains, net profit)")
+        if column_map.get('gpm'):
+            context_lines.append(f"   • Margin: '{column_map['gpm']}' (VP may say: profitability, margin %)")
+        if column_map.get('client'):
+            context_lines.append(f"   • Client: '{column_map['client']}' (VP may say: account, customer, company)")
+        if column_map.get('region'):
+            context_lines.append(f"   • Region: '{column_map['region']}' (VP may say: geography, territory, location)")
+        context_lines.append("")
+    
     context_lines.append("   Source 2 - Resource Headcount Data (STAFFING SNAPSHOT):")
     context_lines.append("   • REPRESENTS: Latest active employee data as of August 2026")
     context_lines.append("   • METRICS: Active headcount, client assignments, practices, regions")
@@ -179,329 +337,178 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw=None, selected_
         context_lines.append(f"  Active Clients: {metrics['accounts']} accounts")
     context_lines.append("")
     
-    context_lines.append("💡 KEY INSIGHTS:")
-    if metrics.get('headcount') and metrics.get('revenue'):
-        rev_per_emp = metrics['revenue'] / (metrics['headcount'] / 1000) if metrics['headcount'] > 0 else 0
-        context_lines.append(f"  Revenue per Employee: ${rev_per_emp:.2f}K")
-    if metrics.get('gpm') and metrics['gpm'] < 5:
-        context_lines.append(f"  ⚠️  ALERT: Low margin ({metrics['gpm']:.2f}%) - review cost structure")
-    elif metrics.get('gpm') and metrics['gpm'] > 20:
-        context_lines.append(f"  ✅ Strong margin ({metrics['gpm']:.2f}%) - healthy profitability")
-    
-    if 'Revenue USD m' in df_cir.columns and 'Client' in df_cir.columns:
-        by_acct = df_cir.groupby('Client')['Revenue USD m'].sum().sort_values(ascending=False)
-        if len(by_acct) > 0:
-            top_client = by_acct.index[0]
-            top_rev = by_acct.iloc[0]
-            concentration = (top_rev / by_acct.sum() * 100) if by_acct.sum() > 0 else 0
-            context_lines.append(f"  📌 Top Account: {top_client} (${top_rev:.3f}M, {concentration:.1f}% of revenue)")
-            if concentration > 40:
-                context_lines.append(f"  ⚠️  HIGH CONCENTRATION - Over-reliance on {top_client}")
-    
-    # Add monthly summary if full data available
-    if df_cir_raw is not None and 'Month' in df_cir_raw.columns and 'Revenue USD m' in df_cir_raw.columns:
+    if df_res is not None and 'Client Name' in df_res.columns:
+        top_clients = df_res['Client Name'].value_counts().head(5)
+        context_lines.append("📋 TOP 5 ACCOUNTS BY HEADCOUNT:")
+        for i, (client, count) in enumerate(top_clients.items(), 1):
+            context_lines.append(f"   {i}. {client}: {count} employees")
         context_lines.append("")
-        context_lines.append("📅 MONTH-BY-MONTH FINANCIAL SUMMARY (Jan-Aug 2026):")
-        for month in sort_months_calendar_order(df_cir_raw['Month'].unique()):
-            month_data = df_cir_raw[df_cir_raw['Month'] == month]
-            if len(month_data) > 0:
-                month_rev = month_data['Revenue USD m'].sum()
-                month_profit = month_data['GP USD m'].sum() if 'GP USD m' in month_data.columns else 0
-                month_gpm = (month_profit / month_rev * 100) if month_rev > 0 else 0
-                context_lines.append(f"   {month}: Revenue ${month_rev:.3f}M | GP ${month_profit:.3f}M | GPM {month_gpm:.2f}%")
     
+    context_lines.append("⚠️ CRITICAL RULES:")
+    context_lines.append("1. The Circle Wise file contains ALL months (Jan-Aug) ALREADY CONSOLIDATED")
+    context_lines.append("2. DO NOT say 'we need July data' - it IS in the context above")
+    context_lines.append("3. DO NOT ask for missing months - all available months are listed above")
+    context_lines.append("4. Headcount is CURRENT SNAPSHOT only (no historical versions)")
+    context_lines.append("5. ALWAYS use the available data - never claim data is missing")
     context_lines.append("")
-    context_lines.append("="*70)
+    
     return "\n".join(context_lines)
 
-def resolve_month_reference(user_query, available_months):
-    """Convert month references to actual month values (calendar order)"""
-    if not available_months:
-        return None
-    
-    available_months_sorted = sort_months_calendar_order(available_months)
-    
-    month_mapping = {
-        'jan': 'Jan', 'january': 'Jan', 'feb': 'Feb', 'february': 'Feb',
-        'mar': 'Mar', 'march': 'Mar', 'apr': 'Apr', 'april': 'Apr', 'may': 'May',
-        'jun': 'Jun', 'june': 'Jun', 'jul': 'Jul', 'july': 'Jul',
-        'aug': 'Aug', 'august': 'Aug', 'sep': 'Sep', 'september': 'Sep',
-        'oct': 'Oct', 'october': 'Oct', 'nov': 'Nov', 'november': 'Nov',
-        'dec': 'Dec', 'december': 'Dec',
-    }
-    
-    query_lower = user_query.lower()
-    
-    for key, month_val in month_mapping.items():
-        if key in query_lower and month_val in available_months_sorted:
-            return month_val
-    
-    if 'last month' in query_lower and len(available_months_sorted) > 1:
-        return available_months_sorted[-2]
-    
-    if 'previous month' in query_lower and len(available_months_sorted) > 1:
-        return available_months_sorted[-2]
-    
-    if 'this month' in query_lower or 'current month' in query_lower:
-        return available_months_sorted[-1]
-    
-    return None
-
-def get_month_comparison(df_cir_raw, current_month):
-    """Calculate month-over-month comparison (calendar order)"""
-    if df_cir_raw is None or 'Month' not in df_cir_raw.columns:
-        return None
-    
-    available_months = sort_months_calendar_order(df_cir_raw['Month'].unique())
-    available_months_list = list(available_months)
-    
-    try:
-        current_idx = available_months_list.index(current_month)
-    except ValueError:
-        return None
-    
-    if current_idx <= 0:
-        return None
-    
-    prev_month = available_months_list[current_idx - 1]
-    
-    if 'Circle' in df_cir_raw.columns:
-        df_curr = df_cir_raw[(df_cir_raw['Month'] == current_month) & (df_cir_raw['Circle'] == GGM_CIRCLE)]
-        df_prev = df_cir_raw[(df_cir_raw['Month'] == prev_month) & (df_cir_raw['Circle'] == GGM_CIRCLE)]
-    else:
-        df_curr = df_cir_raw[df_cir_raw['Month'] == current_month]
-        df_prev = df_cir_raw[df_cir_raw['Month'] == prev_month]
-    
-    if 'Revenue USD m' in df_curr.columns:
-        curr_rev = df_curr['Revenue USD m'].sum()
-        prev_rev = df_prev['Revenue USD m'].sum()
-        growth = ((curr_rev - prev_rev) / prev_rev * 100) if prev_rev > 0 else 0
-        
-        return {
-            'prev_month': prev_month,
-            'prev_revenue': prev_rev,
-            'curr_revenue': curr_rev,
-            'growth_pct': growth
-        }
-    
-    return None
-
 def suggest_questions(df_cir):
-    """Smart suggestions based on available data"""
-    suggestions = [
-        "How are we doing overall? (Portfolio health check)",
-        "What's driving our revenue? (Account breakdown)",
-        "Which accounts are growing fastest?",
-        "How has [client] been performing?",
-        "Show me regional breakdown",
-        "What's our margin trend?",
-        "Where should we focus resources?",
-    ]
-    return suggestions
+    """Generate contextual follow-up questions based on data"""
+    questions = []
+    
+    if 'Client' in df_cir.columns:
+        top_client = df_cir.groupby('Client')['Revenue USD m'].sum().idxmax()
+        questions.append(f"How is {top_client} performing this month?")
+    
+    if 'Region' in df_cir.columns:
+        regions = df_cir['Region'].unique()
+        if len(regions) > 1:
+            questions.append(f"Compare revenue across {', '.join(regions)}")
+    
+    questions.extend([
+        "What are our top 5 accounts by revenue?",
+        "Show me margin trends",
+        "Which accounts are growing?"
+    ])
+    
+    return questions[:3]
 
 def get_groq_response(client, messages):
-    """Get response from Groq with fallback logic and detailed error logging"""
-    from datetime import datetime, timedelta
-    
-    # Track request for rate limiting
-    now = datetime.now()
-    st.session_state.groq_requests.append(now)
-    
-    # Clean up old requests (older than 1 minute)
-    one_minute_ago = now - timedelta(minutes=1)
-    st.session_state.groq_requests = [t for t in st.session_state.groq_requests if t > one_minute_ago]
-    
-    requests_in_last_minute = len(st.session_state.groq_requests)
-    
-    # Show rate limit warning if approaching limit
-    if requests_in_last_minute > 25:
-        st.warning(f"⚠️ Rate limit approaching: {requests_in_last_minute}/30 requests in last minute")
-    
-    if requests_in_last_minute >= 30:
-        st.error(f"🚫 Rate limit exceeded: {requests_in_last_minute}/30 requests in last minute\n\nPlease wait 1 minute before asking more questions")
-        return None
-    
-    errors = []
-    
+    """Get response from Groq API with fallback models"""
     for model in GROQ_MODELS:
         try:
-            st.write(f"🔄 Trying model: {model}...")
-            
-            # Try modern API first (groq >= 0.4.0)
             if hasattr(client, 'messages'):
                 response = client.messages.create(
                     model=model,
                     messages=messages,
-                    max_tokens=1024,
+                    max_tokens=1024
                 )
-            # Fallback for older groq versions
+                return response.content[0].text
             elif hasattr(client, 'chat') and hasattr(client.chat, 'completions'):
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    max_tokens=1024,
+                    max_tokens=1024
                 )
-            else:
-                raise AttributeError("Groq client missing both 'messages' and 'chat.completions' APIs")
-            
-            if hasattr(response, 'content'):
-                # Modern API response
-                if response.content and len(response.content) > 0:
-                    st.write(f"✅ Success with {model}")
-                    return response.content[0].text
-            elif hasattr(response, 'choices'):
-                # Legacy API response
-                if response.choices and len(response.choices) > 0:
-                    st.write(f"✅ Success with {model}")
-                    return response.choices[0].message.content
-            else:
-                error_msg = "No content in response"
-                errors.append(f"  • {model}: {error_msg}")
-                st.write(f"⚠️ {model}: {error_msg}")
-                
+                return response.choices[0].message.content
         except Exception as e:
-            error_msg = str(e)
-            error_type = type(e).__name__
-            errors.append(f"  • {model}: [{error_type}] {error_msg}")
-            st.write(f"❌ {model} failed: {error_type}")
-            st.write(f"   Details: {error_msg}")
-    
-    # All models failed - provide diagnostic info
-    error_summary = "\n".join(errors) if errors else "Unknown error"
-    
-    st.error(f"""⚠️ **All Groq models failed**
-
-**Error Details:**
-{error_summary}
-
-**Likely cause:** Groq library version mismatch
-
-**Quick fix:**
-1. Open PowerShell
-2. Run: `pip install --upgrade groq`
-3. Refresh the Streamlit app (F5)
-4. Click "Test Groq Connection" again
-
-**If still failing:**
-1. Check Groq API key is valid (start with gsk_)
-2. Check Groq service status: https://status.groq.com/
-3. Verify internet connectivity
-4. Try waiting 1-2 minutes if rate limited
-""")
+            continue
     
     return None
 
-# ===== MAIN APP =====
-
-df_res = None
-df_cir = None
-df_cir_raw = None
-selected_month = None
-data_loaded = False
-
+# ===== SESSION STATE INITIALIZATION =====
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "groq_requests" not in st.session_state:
-    st.session_state.groq_requests = []  # Track timestamps of requests
+    st.session_state.groq_requests = []
 
+# ===== SIDEBAR CONFIGURATION =====
+st.sidebar.title("⚙️ Settings")
+
+df_cir = None
+df_cir_raw = None
+df_res = None
+data_loaded = False
+selected_month = None
+
+# ===== DATA SOURCE: LOCAL FOLDER AUTO-DISCOVERY =====
 st.sidebar.markdown("---")
-st.sidebar.subheader("🔧 Diagnostics")
+st.sidebar.subheader("📂 Data Source")
 
-# Show rate limit status
-if "groq_requests" in st.session_state:
-    from datetime import datetime, timedelta
-    
-    now = datetime.now()
-    one_minute_ago = now - timedelta(minutes=1)
-    requests_in_last_minute = len([t for t in st.session_state.groq_requests if t > one_minute_ago])
-    
-    if requests_in_last_minute == 0:
-        st.sidebar.success(f"📊 Requests (1min): {requests_in_last_minute}/30 ✅")
-    elif requests_in_last_minute < 25:
-        st.sidebar.info(f"📊 Requests (1min): {requests_in_last_minute}/30")
-    elif requests_in_last_minute < 30:
-        st.sidebar.warning(f"📊 Requests (1min): {requests_in_last_minute}/30 ⚠️")
-    else:
-        st.sidebar.error(f"📊 Requests (1min): {requests_in_last_minute}/30 🚫 LIMIT HIT")
+data_source = st.sidebar.radio("Choose source:", ["Local Folder (Auto-Load)", "Manual Upload"])
 
-# Test Groq Connection
-if st.sidebar.button("🧪 Test Groq Connection"):
-    groq_api_key = st.secrets.get("groq", {}).get("api_key")
+if data_source == "Local Folder (Auto-Load)":
+    st.sidebar.write("📁 Auto-loading from GGM Portfolio Analytics folder...")
     
-    if not groq_api_key:
-        st.sidebar.error("❌ No Groq API key in secrets")
-    else:
-        try:
-            from groq import Groq
-            client = Groq(api_key=groq_api_key)
-            
-            st.sidebar.info("Testing connection to Groq...")
-            
-            # Try modern API first
+    # Your folder path
+    BASE_PATH = r"C:\Users\satyaprabha.v\OneDrive - ascendion\Documents\GGM Data\GGM Portfolio Analytics"
+    YEAR = "2026"
+    
+    if st.sidebar.button("🔄 Load Historical Data"):
+        with st.spinner("Scanning folders and loading data..."):
             try:
-                response = client.messages.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": "Say 'OK' in one word"}],
-                    max_tokens=50,
+                df_cir_raw, df_res = load_monthly_data_from_folder(
+                    base_path=BASE_PATH,
+                    year=YEAR,
+                    circle_name='Data and Insights'
                 )
-                result = response.content[0].text if response.content else "No response"
-            except AttributeError:
-                # Fallback for older groq library versions
-                response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": "Say 'OK' in one word"}],
-                    max_tokens=50,
-                )
-                result = response.choices[0].message.content if response.choices else "No response"
-            
-            st.sidebar.success(f"✅ Groq is reachable!\n\nResponse: {result}")
                 
-        except AttributeError as e:
-            st.sidebar.error(f"❌ Library version issue:\n\n{type(e).__name__}\n\nFix: `pip install --upgrade groq`\n\nError: {str(e)}")
-        except Exception as e:
-            st.sidebar.error(f"❌ Connection failed:\n\n{type(e).__name__}\n\n{str(e)}")
+                if df_cir_raw is not None and len(df_cir_raw) > 0:
+                    data_loaded = True
+                    
+                    # Show available months
+                    available_months = get_available_months(df_cir_raw)
+                    st.sidebar.success(f"✅ Data loaded!")
+                    st.sidebar.write(f"📅 Available months: {', '.join(available_months)}")
+                    
+                    # Month selector
+                    selected_month = st.sidebar.selectbox(
+                        "Select month for dashboard:",
+                        options=available_months,
+                        index=len(available_months) - 1  # Default to latest month
+                    )
+                    
+                    # Filter to selected month for current dashboard
+                    if selected_month:
+                        df_cir = df_cir_raw[df_cir_raw['Month'] == selected_month].copy()
+                        st.sidebar.write(f"📊 Dashboard month: {selected_month}")
+                else:
+                    st.sidebar.error("❌ No data loaded. Check folder structure.")
+            
+            except Exception as e:
+                st.sidebar.error(f"❌ Error: {str(e)}")
+                st.sidebar.write("💡 Check that:")
+                st.sidebar.write("- Folder path is correct")
+                st.sidebar.write("- Month folders exist (August, July, etc.)")
+                st.sidebar.write("- Excel files are in month folders")
 
-st.sidebar.markdown("---")
-data_source = st.sidebar.radio("Data Source", ["Upload Files", "OneDrive"])
-
-if data_source == "Upload Files":
+elif data_source == "Manual Upload":
+    st.sidebar.write("📁 Manual File Upload")
+    
     resource_file = st.sidebar.file_uploader("Resource Data (Optional)", type=['xlsx'])
     circle_file = st.sidebar.file_uploader("Circle Wise Data (Required)", type=['xlsx'])
     
     if circle_file:
         try:
-            df_cir_raw = pd.read_excel(circle_file, sheet_name='Sheet1', header=0)
-            st.sidebar.write(f"📊 Loaded {len(df_cir_raw)} records")
+            # Single sheet load for manual upload
+            df_cir_raw = pd.read_excel(circle_file, sheet_name=0, header=0)
             
-            if 'Month' in df_cir_raw.columns:
-                available_months = sort_months_calendar_order(df_cir_raw['Month'].unique())
-                st.sidebar.write(f"📅 Months (calendar order): {', '.join(map(str, available_months))}")
-                
-                selected_month = st.sidebar.selectbox(
-                    "Select month:",
-                    options=available_months,
-                    index=len(available_months) - 1
-                )
-                st.sidebar.write(f"✅ Selected: {selected_month}")
-                
-                df_cir = df_cir_raw[df_cir_raw['Month'] == selected_month].copy()
-            else:
-                df_cir = df_cir_raw.copy()
+            if 'Circle' in df_cir_raw.columns:
+                df_cir_raw = df_cir_raw[df_cir_raw['Circle'] == 'Data and Insights']
             
-            if 'Circle' in df_cir.columns:
-                df_cir = df_cir[df_cir['Circle'] == GGM_CIRCLE]
-                st.sidebar.write(f"✅ Filtered: {len(df_cir)} {GGM_CIRCLE} records")
+            st.sidebar.write(f"✅ Loaded {len(df_cir_raw)} records")
             
             if resource_file:
                 df_res = pd.read_excel(resource_file, sheet_name=0, header=0)
                 if 'Practices' in df_res.columns:
-                    df_res = df_res[df_res['Practices'] == GGM_CIRCLE]
-                st.sidebar.write(f"👥 Loaded {len(df_res)} resources")
+                    df_res = df_res[df_res['Practices'] == 'Data and Insights']
+                st.sidebar.write(f"✅ Loaded {len(df_res)} employees")
             
-            data_loaded = True
-            
+            if df_cir_raw is not None and len(df_cir_raw) > 0:
+                data_loaded = True
+                
+                # Check for Month column for historical data
+                if 'Month' in df_cir_raw.columns:
+                    available_months = sort_months_calendar_order(df_cir_raw['Month'].unique())
+                    st.sidebar.write(f"📅 Months (calendar order): {', '.join(map(str, available_months))}")
+                    
+                    selected_month = st.sidebar.selectbox(
+                        "Select month:",
+                        options=available_months,
+                        index=len(available_months) - 1
+                    )
+                    st.sidebar.write(f"✅ Selected: {selected_month}")
+                    
+                    df_cir = df_cir_raw[df_cir_raw['Month'] == selected_month].copy()
+                else:
+                    df_cir = df_cir_raw.copy()
+                
+                st.sidebar.success("✅ Data loaded!")
+        
         except Exception as e:
-            st.sidebar.error(f"❌ Error loading data: {str(e)}")
+            st.sidebar.error(f"Error: {str(e)}")
 
 if data_loaded and df_cir is not None:
     # Check Groq API key
@@ -520,7 +527,9 @@ if data_loaded and df_cir is not None:
             "4. Redeploy the app"
         )
     
-    metrics = get_available_metrics(df_cir, df_res)
+    # Detect columns once for the entire session
+    column_map = detect_column_mapping(df_cir, df_res)
+    metrics = get_available_metrics(df_cir, df_res, column_map)
     
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Current Revenue", f"${metrics.get('revenue', 0):.3f}M")
@@ -572,7 +581,8 @@ if data_loaded and df_cir is not None:
             answer = None  # Initialize so it's available outside try block
             with st.spinner("Analyzing..."):
                 try:
-                    dynamic_context = generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month)
+                    # Use already-detected column mapping for consistent handling
+                    dynamic_context = generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month, column_map)
                     groq_api_key = st.secrets.get("groq", {}).get("api_key")
                     
                     if not groq_api_key:
@@ -582,25 +592,40 @@ if data_loaded and df_cir is not None:
                         client = Groq(api_key=groq_api_key)
                         
                         synonym_context = expand_synonyms(matched_prompt)
-                        system_prompt = f"""You are a senior portfolio analyst briefing executives on GGM D&I portfolio performance.
+                        system_prompt = f"""You are a senior portfolio analyst briefing C-level executives on GGM D&I portfolio performance.
 
 CRITICAL DATA STRUCTURE - UNDERSTAND THIS FIRST:
 {dynamic_context}
 
-⚠️ IMPORTANT RULES:
-1. ALL financial data (revenue, GP, GPM) for Jan-Aug 2026 is ALREADY IN your context
-2. DO NOT ask for missing months - they are provided above
+⚠️ UNDERSTANDING EXECUTIVE TERMINOLOGY:
+1. VPs may use business language instead of exact column names
+   • "revenue" = "sales", "topline", "income", "billing"
+   • "profit" = "GP", "gains", "earnings", "returns"
+   • "margin" = "profitability", "margin %", "efficiency"
+   • "headcount" = "staff", "team", "people", "resources", "FTE"
+   • "account" = "client", "customer", "engagement", "company"
+   • "region" = "geography", "territory", "location", "zone"
+
+2. Translate VP questions to actual data columns automatically
+   • When VP asks "How are we doing on sales?", use revenue data
+   • When VP asks "Show me our staff breakdown", use headcount data
+   • When VP asks "Which are our top customers?", use client/account data
+
+⚠️ CRITICAL DATA RULES:
+1. ALL financial data (revenue, cost, profit, margin) for Jan-Aug 2026 is ALREADY IN your context
+2. DO NOT ask for missing months - they are provided in the column mapping above
 3. DO NOT ask for July data when doing Aug vs Jul comparison - use the data provided
 4. Headcount is a CURRENT SNAPSHOT (August 2026) - it doesn't have historical versions
-5. When comparing months, use the months available above (Jan-Aug)
+5. When comparing months, use months available (Jan-Aug)
 6. When you say "we need data", check the context above first - it's probably there
 
 WHAT YOU CAN ANSWER:
-✅ Any month Jan-Aug financial metrics (revenue, profit, margin, regional breakdown)
-✅ Month-over-month comparisons and growth rates
+✅ Any financial metric (any terminology) for Jan-Aug
+✅ Month-over-month comparisons with growth rates
 ✅ Trends across multiple months
 ✅ Current headcount and staffing by account
-✅ Account rankings, concentration analysis, efficiency metrics
+✅ Account/client rankings, concentration, efficiency metrics
+✅ Regional performance and breakdown
 
 WHAT YOU CANNOT DO:
 ❌ Provide September or later data (doesn't exist)
@@ -608,11 +633,12 @@ WHAT YOU CANNOT DO:
 ❌ Make assumptions about data - use only what's in the context
 
 RESPONSE GUIDELINES:
-1. Start with direct answer to their question
-2. Use AVAILABLE data from the context above (don't ask for it)
-3. Include month-to-month comparisons when relevant
-4. Provide business implications and insights
-5. Suggest 2-3 follow-up questions that can be answered with available data
+1. Start with DIRECT answer (VPs value brevity)
+2. Translate business language to data automatically
+3. Use AVAILABLE data from the context (don't ask for it)
+4. Include month-to-month comparisons when relevant
+5. Provide business implications, not just numbers
+6. Suggest 2-3 follow-up questions phrased in business language
 
 {synonym_context}"""
                         
@@ -651,4 +677,4 @@ RESPONSE GUIDELINES:
                         )
 
 else:
-    st.info("📁 Upload Circle Wise data to start")
+    st.info("📁 Upload Circle Wise data or click 'Load Historical Data' to start")
