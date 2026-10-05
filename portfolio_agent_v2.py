@@ -87,10 +87,10 @@ def generate_dynamic_context(df_cir, df_res, metrics):
         context_lines.append(by_reg.round(3).to_string())
         context_lines.append("")
     
-    # Headcount by client (all rows are active)
+    # Headcount by client (all rows are active) - FULL LIST for AI context
     if df_res is not None and 'Client Name' in df_res.columns:
-        hc_by_client = df_res.groupby('Client Name').size().sort_values(ascending=False).head(5)
-        context_lines.append("Top 5 Accounts by Headcount:")
+        hc_by_client = df_res.groupby('Client Name').size().sort_values(ascending=False)
+        context_lines.append(f"Headcount by Account (All {len(hc_by_client)} clients):")
         context_lines.append(hc_by_client.to_string())
         context_lines.append("")
     
@@ -102,6 +102,8 @@ def suggest_questions(df_cir):
         "What is total revenue?",
         "Show top accounts by revenue",
         "Revenue breakdown by region",
+        "What is headcount by client?",
+        "How many employees at ZS Associates?",
     ]
     
     if 'GPM' in df_cir.columns or 'GP USD m' in df_cir.columns:
@@ -315,6 +317,7 @@ if data_loaded:
     
     # Show suggestions
     with st.expander("💡 Suggested questions"):
+        st.info("📊 Complete headcount data for all accounts is available. Ask about any client!")
         suggestions = suggest_questions(df_cir)
         for suggestion in suggestions:
             st.write(f"• {suggestion}")
