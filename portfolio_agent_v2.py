@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import plotly.express as px
+from difflib import SequenceMatcher
 
 st.set_page_config(page_title="GGM D&I Portfolio Agent", layout="wide")
 st.title("📊 GGM D&I Portfolio Agent")
@@ -17,6 +18,36 @@ GROQ_MODELS = [
 ]
 
 # ===== UTILITY FUNCTIONS =====
+
+def fuzzy_match_client(user_text, df_res):
+    """Find matching client names from user query using fuzzy matching"""
+    if df_res is None or 'Client Name' not in df_res.columns:
+        return user_text
+    
+    actual_clients = df_res['Client Name'].unique()
+    words = user_text.lower().split()
+    updated_text = user_text
+    
+    for word in words:
+        if len(word) < 3:  # Skip very short words
+            continue
+        
+        # Find best match
+        best_match = None
+        best_score = 0
+        
+        for client in actual_clients:
+            # Similarity score between word and client name
+            ratio = SequenceMatcher(None, word.lower(), client.lower()).ratio()
+            if ratio > best_score and ratio > 0.6:  # Threshold of 60% similarity
+                best_score = ratio
+                best_match = client
+        
+        # Replace word with full client name if good match found
+        if best_match:
+            updated_text = updated_text.replace(word, best_match, 1)
+    
+    return updated_text
 def get_available_metrics(df_cir, df_res):
     """Dynamically identify available metrics"""
     metrics = {}
@@ -330,9 +361,14 @@ if data_loaded:
             st.markdown(msg["content"])
     
     if prompt := st.chat_input("Ask about revenue, accounts, regions, margins..."):
+        # Apply fuzzy matching to client names in prompt
+        matched_prompt = fuzzy_match_client(prompt, df_res)
+        
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
+            if matched_prompt != prompt:
+                st.caption(f"🔍 Recognized: {matched_prompt}")
         
         with st.chat_message("assistant"):
             with st.spinner("Analyzing..."):
@@ -362,7 +398,7 @@ if data_loaded:
                                     "role": "system",
                                     "content": f"You are a portfolio analysis expert. Answer questions based on this data:\n\n{dynamic_context}"
                                 },
-                                {"role": "user", "content": prompt}
+                                {"role": "user", "content": matched_prompt}  # Use matched_prompt for accurate client lookup
                             ]
                             
                             answer = get_groq_response(client, messages)
