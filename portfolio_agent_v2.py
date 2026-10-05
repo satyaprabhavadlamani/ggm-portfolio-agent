@@ -299,15 +299,33 @@ def get_groq_response(client, messages):
         try:
             st.write(f"🔄 Trying model: {model}...")
             
-            response = client.messages.create(
-                model=model,
-                messages=messages,
-                max_tokens=1024,
-            )
+            # Try modern API first (groq >= 0.4.0)
+            if hasattr(client, 'messages'):
+                response = client.messages.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=1024,
+                )
+            # Fallback for older groq versions
+            elif hasattr(client, 'chat') and hasattr(client.chat, 'completions'):
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=1024,
+                )
+            else:
+                raise AttributeError("Groq client missing both 'messages' and 'chat.completions' APIs")
             
-            if response.content and len(response.content) > 0:
-                st.write(f"✅ Success with {model}")
-                return response.content[0].text
+            if hasattr(response, 'content'):
+                # Modern API response
+                if response.content and len(response.content) > 0:
+                    st.write(f"✅ Success with {model}")
+                    return response.content[0].text
+            elif hasattr(response, 'choices'):
+                # Legacy API response
+                if response.choices and len(response.choices) > 0:
+                    st.write(f"✅ Success with {model}")
+                    return response.choices[0].message.content
             else:
                 error_msg = "No content in response"
                 errors.append(f"  • {model}: {error_msg}")
@@ -328,17 +346,19 @@ def get_groq_response(client, messages):
 **Error Details:**
 {error_summary}
 
-**Diagnostics to check:**
-1. Verify API key is correctly set in Streamlit secrets
-2. Check Groq service status: https://status.groq.com/
-3. Verify internet connectivity from Streamlit Cloud
-4. Check if rate limit exceeded (30 req/min)
-5. Verify model names are still valid
+**Likely cause:** Groq library version mismatch
 
-**What to do:**
-• Wait 2 minutes and try again
-• If persists, check Groq status page
-• Verify API key format (should start with `gsk_`)
+**Quick fix:**
+1. Open PowerShell
+2. Run: `pip install --upgrade groq`
+3. Refresh the Streamlit app (F5)
+4. Click "Test Groq Connection" again
+
+**If still failing:**
+1. Check Groq API key is valid (start with gsk_)
+2. Check Groq service status: https://status.groq.com/
+3. Verify internet connectivity
+4. Try waiting 1-2 minutes if rate limited
 """)
     
     return None
@@ -391,17 +411,27 @@ if st.sidebar.button("🧪 Test Groq Connection"):
             
             st.sidebar.info("Testing connection to Groq...")
             
-            response = client.messages.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": "Say 'Connection successful' in one short sentence"}],
-                max_tokens=50,
-            )
+            # Try modern API first
+            try:
+                response = client.messages.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": "Say 'OK' in one word"}],
+                    max_tokens=50,
+                )
+                result = response.content[0].text if response.content else "No response"
+            except AttributeError:
+                # Fallback for older groq library versions
+                response = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": "Say 'OK' in one word"}],
+                    max_tokens=50,
+                )
+                result = response.choices[0].message.content if response.choices else "No response"
             
-            if response.content:
-                st.sidebar.success(f"✅ Groq is reachable!\n\nResponse: {response.content[0].text}")
-            else:
-                st.sidebar.error("❌ No response from Groq")
+            st.sidebar.success(f"✅ Groq is reachable!\n\nResponse: {result}")
                 
+        except AttributeError as e:
+            st.sidebar.error(f"❌ Library version issue:\n\n{type(e).__name__}\n\nFix: `pip install --upgrade groq`\n\nError: {str(e)}")
         except Exception as e:
             st.sidebar.error(f"❌ Connection failed:\n\n{type(e).__name__}\n\n{str(e)}")
 
