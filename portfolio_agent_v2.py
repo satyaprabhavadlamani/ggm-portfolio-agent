@@ -135,11 +135,26 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw=None, selected_
     """Generate comprehensive executive-level context for AI"""
     context_lines = ["="*70, "PORTFOLIO INTELLIGENCE DASHBOARD", "="*70, ""]
     
+    # Explain data file structure upfront
+    context_lines.append("📂 DATA FILE STRUCTURE & AVAILABILITY:")
+    context_lines.append("   Source 1 - Circle Wise Financial Data (FINANCIAL METRICS):")
+    context_lines.append("   • CONTAINS: All months Jan 2026 through Aug 2026 in single consolidated Excel sheet")
+    context_lines.append("   • METRICS: Revenue USD m, Cost USD m, GP USD m, GPM % for EACH month")
+    context_lines.append("   • STRUCTURE: One row per month-region-client combination")
+    context_lines.append("")
+    context_lines.append("   Source 2 - Resource Headcount Data (STAFFING SNAPSHOT):")
+    context_lines.append("   • REPRESENTS: Latest active employee data as of August 2026")
+    context_lines.append("   • METRICS: Active headcount, client assignments, practices, regions")
+    context_lines.append("   • STRUCTURE: One row per active employee (no historical versions)")
+    context_lines.append("")
+    
     if df_cir_raw is not None and 'Month' in df_cir_raw.columns:
         available_months = sort_months_calendar_order(df_cir_raw['Month'].unique())
-        context_lines.append(f"📅 DATASET CONTAINS {len(available_months)} MONTHS OF HISTORICAL DATA:")
-        context_lines.append(f"   Available months (calendar order): {', '.join(map(str, available_months))}")
-        context_lines.append(f"   Currently analyzing: {selected_month if selected_month else 'Latest month'}")
+        context_lines.append(f"✅ FINANCIAL DATA AVAILABLE FOR ALL MONTHS:")
+        context_lines.append(f"   Months available: {', '.join(map(str, available_months))} (complete set)")
+        context_lines.append(f"   Currently selected for dashboard: {selected_month if selected_month else 'August (latest)'}")
+        context_lines.append(f"   Full historical data: Available for month-over-month analysis, trends, seasonal patterns")
+        context_lines.append("")
         
         if selected_month and len(available_months) > 1:
             available_months_list = list(available_months)
@@ -147,8 +162,9 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw=None, selected_
                 idx = available_months_list.index(selected_month)
                 if idx > 0:
                     prev_month = available_months_list[idx - 1]
-                    context_lines.append(f"   Can compare to: {prev_month} (previous month in calendar order)")
-        context_lines.append("")
+                    context_lines.append(f"📊 COMPARISON CAPABILITY:")
+                    context_lines.append(f"   {selected_month} vs {prev_month}: Month-over-month metrics available")
+                    context_lines.append("")
     
     context_lines.append("📊 PORTFOLIO SNAPSHOT:")
     if 'revenue' in metrics:
@@ -181,6 +197,18 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw=None, selected_
             context_lines.append(f"  📌 Top Account: {top_client} (${top_rev:.3f}M, {concentration:.1f}% of revenue)")
             if concentration > 40:
                 context_lines.append(f"  ⚠️  HIGH CONCENTRATION - Over-reliance on {top_client}")
+    
+    # Add monthly summary if full data available
+    if df_cir_raw is not None and 'Month' in df_cir_raw.columns and 'Revenue USD m' in df_cir_raw.columns:
+        context_lines.append("")
+        context_lines.append("📅 MONTH-BY-MONTH FINANCIAL SUMMARY (Jan-Aug 2026):")
+        for month in sort_months_calendar_order(df_cir_raw['Month'].unique()):
+            month_data = df_cir_raw[df_cir_raw['Month'] == month]
+            if len(month_data) > 0:
+                month_rev = month_data['Revenue USD m'].sum()
+                month_profit = month_data['GP USD m'].sum() if 'GP USD m' in month_data.columns else 0
+                month_gpm = (month_profit / month_rev * 100) if month_rev > 0 else 0
+                context_lines.append(f"   {month}: Revenue ${month_rev:.3f}M | GP ${month_profit:.3f}M | GPM {month_gpm:.2f}%")
     
     context_lines.append("")
     context_lines.append("="*70)
@@ -552,16 +580,37 @@ if data_loaded and df_cir is not None:
                         client = Groq(api_key=groq_api_key)
                         
                         synonym_context = expand_synonyms(matched_prompt)
-                        system_prompt = f"""You are a senior portfolio analyst. Provide executive-level insights on the portfolio data below.
+                        system_prompt = f"""You are a senior portfolio analyst briefing executives on GGM D&I portfolio performance.
 
-DATA:
+CRITICAL DATA STRUCTURE - UNDERSTAND THIS FIRST:
 {dynamic_context}
 
-GUIDELINES:
-1. Start with direct answer
-2. Provide context and implications
-3. Include comparisons and insights
-4. End with 2-3 follow-up suggestions
+⚠️ IMPORTANT RULES:
+1. ALL financial data (revenue, GP, GPM) for Jan-Aug 2026 is ALREADY IN your context
+2. DO NOT ask for missing months - they are provided above
+3. DO NOT ask for July data when doing Aug vs Jul comparison - use the data provided
+4. Headcount is a CURRENT SNAPSHOT (August 2026) - it doesn't have historical versions
+5. When comparing months, use the months available above (Jan-Aug)
+6. When you say "we need data", check the context above first - it's probably there
+
+WHAT YOU CAN ANSWER:
+✅ Any month Jan-Aug financial metrics (revenue, profit, margin, regional breakdown)
+✅ Month-over-month comparisons and growth rates
+✅ Trends across multiple months
+✅ Current headcount and staffing by account
+✅ Account rankings, concentration analysis, efficiency metrics
+
+WHAT YOU CANNOT DO:
+❌ Provide September or later data (doesn't exist)
+❌ Provide historical headcount versions (only current snapshot available)
+❌ Make assumptions about data - use only what's in the context
+
+RESPONSE GUIDELINES:
+1. Start with direct answer to their question
+2. Use AVAILABLE data from the context above (don't ask for it)
+3. Include month-to-month comparisons when relevant
+4. Provide business implications and insights
+5. Suggest 2-3 follow-up questions that can be answered with available data
 
 {synonym_context}"""
                         
