@@ -273,6 +273,8 @@ def suggest_questions(df_cir):
 
 def get_groq_response(client, messages):
     """Get response from Groq with fallback logic"""
+    errors = []
+    
     for model in GROQ_MODELS:
         try:
             response = client.messages.create(
@@ -283,9 +285,26 @@ def get_groq_response(client, messages):
             if response.content and len(response.content) > 0:
                 return response.content[0].text
         except Exception as e:
-            continue
+            error_msg = str(e)
+            errors.append(f"  • {model}: {error_msg}")
     
-    return "⚠️ Unable to get response from all models. Please try again."
+    # All models failed - provide diagnostic info
+    error_summary = "\n".join(errors) if errors else "Unknown error"
+    return f"""⚠️ **Unable to get response from Groq API**
+
+**Possible causes:**
+1. API key missing or invalid in Streamlit secrets
+2. Groq service temporarily unavailable (check https://status.groq.com)
+3. Rate limit reached (30 requests/min on free tier)
+4. Network connectivity issue
+
+**Failed models:**
+{error_summary}
+
+**Next steps:**
+• Verify Groq API key in Streamlit → Settings → Secrets
+• Wait 1-2 minutes if rate limited
+• Try again in a few moments"""
 
 # ===== MAIN APP =====
 
@@ -342,6 +361,22 @@ if data_source == "Upload Files":
             st.sidebar.error(f"❌ Error loading data: {str(e)}")
 
 if data_loaded and df_cir is not None:
+    # Check Groq API key
+    groq_api_key = st.secrets.get("groq", {}).get("api_key")
+    if not groq_api_key:
+        st.warning(
+            "⚠️ **Groq API key not configured**\n\n"
+            "To enable the AI agent:\n"
+            "1. Go to Streamlit Cloud → Settings → Secrets\n"
+            "2. Add:\n"
+            "```\n"
+            "[groq]\n"
+            "api_key = \"gsk_your_key_here\"\n"
+            "```\n"
+            "3. Get your key: https://console.groq.com/keys\n"
+            "4. Redeploy the app"
+        )
+    
     metrics = get_available_metrics(df_cir, df_res)
     
     col1, col2, col3, col4 = st.columns(4)
