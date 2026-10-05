@@ -401,8 +401,6 @@ data_loaded = False
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "process_followup" not in st.session_state:
-    st.session_state.process_followup = None
 if "groq_requests" not in st.session_state:
     st.session_state.groq_requests = []  # Track timestamps of requests
 
@@ -550,17 +548,20 @@ if data_loaded and df_cir is not None:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
     
-    # Check if a follow-up button was clicked (will have set process_followup in session state)
-    prompt = None
-    if st.session_state.process_followup:
-        prompt = st.session_state.process_followup
-        st.session_state.process_followup = None
-    else:
-        prompt = st.chat_input("Ask about revenue, accounts, regions...")
+    # Get prompt from either chat input OR detect if button was clicked
+    prompt = st.chat_input("Ask about revenue, accounts, regions...")
+    
+    # If no chat input but last message is user (unresponded), it's from button click
+    if not prompt and len(st.session_state.messages) > 0:
+        if st.session_state.messages[-1].get("role") == "user":
+            prompt = st.session_state.messages[-1].get("content")
     
     if prompt:
         matched_prompt = fuzzy_match_client(prompt, df_res)
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Only append message if it's not already the last message (from button click)
+        if len(st.session_state.messages) == 0 or st.session_state.messages[-1].get("content") != prompt:
+            st.session_state.messages.append({"role": "user", "content": prompt})
         
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -568,6 +569,7 @@ if data_loaded and df_cir is not None:
                 st.caption(f"🔍 Recognized: {matched_prompt}")
         
         with st.chat_message("assistant"):
+            answer = None  # Initialize so it's available outside try block
             with st.spinner("Analyzing..."):
                 try:
                     dynamic_context = generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month)
@@ -624,21 +626,29 @@ RESPONSE GUIDELINES:
                         if answer:
                             st.session_state.messages.append({"role": "assistant", "content": answer})
                             st.markdown(answer)
-                        
-                        st.divider()
-                        st.caption("💡 **Suggested follow-ups:**")
-                        col1, col2, col3 = st.columns(3)
-                        followups = ["Show me the trend", "Deep dive into top account", "Compare to last month"]
-                        
-                        for i, followup in enumerate(followups):
-                            with [col1, col2, col3][i]:
-                                if st.button(followup, key=f"followup_{i}"):
-                                    # Set flag to process this message on rerun
-                                    st.session_state.process_followup = followup
-                                    st.rerun()
                 
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
+            
+            # Buttons OUTSIDE spinner so they persist (not hidden after loading)
+            if answer:
+                st.divider()
+                st.caption("💡 **Suggested follow-ups:**")
+                col1, col2, col3 = st.columns(3)
+                followups = ["Show me the trend", "Deep dive into top account", "Compare to last month"]
+                
+                # Define callback to add message and trigger rerun
+                def on_followup_click(text):
+                    st.session_state.messages.append({"role": "user", "content": text})
+                
+                for i, followup in enumerate(followups):
+                    with [col1, col2, col3][i]:
+                        st.button(
+                            followup,
+                            key=f"btn_{i}_{hash(str(st.session_state.messages))}",
+                            on_click=on_followup_click,
+                            args=(followup,)
+                        )
 
 else:
     st.info("📁 Upload Circle Wise data to start")
