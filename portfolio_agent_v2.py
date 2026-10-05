@@ -17,6 +17,53 @@ GROQ_MODELS = [
     "gemma2-9b-it",                # Lightweight fallback
 ]
 
+# ===== EXECUTIVE SYNONYM MAPPING =====
+SYNONYM_MAP = {
+    # Revenue synonyms
+    'revenue': ['sales', 'top line', 'topline', 'income', 'earnings', 'throughput', 'business', 'volume'],
+    'revenue_amount': ['revenue', 'sales', 'top line', 'generated', 'brought in'],
+    
+    # Profit synonyms
+    'profit': ['gp', 'gross profit', 'margin', 'bottomline', 'bottom line', 'earnings', 'returns', 'benefit'],
+    'gp_amount': ['profit', 'gp', 'gross profit', 'gains'],
+    
+    # Margin synonyms
+    'gpm': ['margin', 'profitability', 'margin %', 'percentage', 'efficiency', 'returns', 'yield'],
+    
+    # Headcount synonyms
+    'headcount': ['staff', 'team', 'people', 'employees', 'strength', 'bench', 'resources', 'workforce', 'fte'],
+    'headcount_amount': ['headcount', 'staff', 'people', 'team size', 'strength'],
+    
+    # Account/Client synonyms
+    'account': ['client', 'customer', 'partner', 'engagement', 'project', 'contract', 'business'],
+    'client_name': ['account', 'client', 'customer', 'project', 'engagement'],
+    
+    # Region synonyms
+    'region': ['geography', 'location', 'zone', 'area', 'market', 'country', 'place'],
+    
+    # Time synonyms
+    'mtd': ['month', 'current month', 'this month', 'monthly'],
+    'qtd': ['quarter', 'quarterly', 'this quarter', 'current quarter'],
+    'ytd': ['year', 'annual', 'yearly', 'this year', 'current year'],
+    
+    # Comparison synonyms
+    'growth': ['increase', 'improvement', 'trend', 'change', 'momentum', 'uptick'],
+    'decline': ['decrease', 'drop', 'fall', 'downturn', 'reduction', 'dip'],
+    
+    # Analysis synonyms
+    'top': ['best', 'largest', 'biggest', 'highest', 'leading', 'major'],
+    'bottom': ['worst', 'smallest', 'lowest', 'trailing', 'weakest'],
+}
+
+def expand_synonyms(text):
+    """Expand user query with synonym explanations for AI"""
+    expanded_context = "\n[SYNONYM CONTEXT]: "
+    for main_term, synonyms in SYNONYM_MAP.items():
+        for syn in synonyms:
+            if syn.lower() in text.lower():
+                expanded_context += f"'{syn}' = {main_term}; "
+    return expanded_context if expanded_context != "\n[SYNONYM CONTEXT]: " else ""
+
 # ===== UTILITY FUNCTIONS =====
 
 def fuzzy_match_client(user_text, df_res):
@@ -85,65 +132,125 @@ def get_available_metrics(df_cir, df_res):
     return metrics
 
 def generate_dynamic_context(df_cir, df_res, metrics):
-    """Generate context dynamically based on available data"""
-    context_lines = ["PORTFOLIO ANALYSIS DATA:\n"]
+    """Generate comprehensive executive-level context for AI"""
+    context_lines = ["="*70, "PORTFOLIO INTELLIGENCE DASHBOARD", "="*70, ""]
     
-    # Current metrics
+    # EXECUTIVE SUMMARY
+    context_lines.append("📊 PORTFOLIO SNAPSHOT:")
     if 'revenue' in metrics:
-        context_lines.append(f"- Total Revenue: ${metrics['revenue']:.3f}M")
-    if 'cost' in metrics:
-        context_lines.append(f"- Total Cost: ${metrics['cost']:.3f}M")
+        context_lines.append(f"  Revenue:        ${metrics['revenue']:.3f}M USD")
     if 'profit' in metrics:
-        context_lines.append(f"- Gross Profit: ${metrics['profit']:.3f}M")
+        context_lines.append(f"  Gross Profit:   ${metrics['profit']:.3f}M USD")
     if 'gpm' in metrics:
-        context_lines.append(f"- Profit Margin: {metrics['gpm']:.2f}%")
+        context_lines.append(f"  Profit Margin:  {metrics['gpm']:.2f}%")
     if metrics.get('headcount'):
-        context_lines.append(f"- Headcount (Active): {metrics['headcount']}")
+        context_lines.append(f"  Headcount:      {metrics['headcount']} people")
     if metrics.get('accounts'):
-        context_lines.append(f"- Accounts: {metrics['accounts']}")
-    
+        context_lines.append(f"  Active Clients: {metrics['accounts']} accounts")
     context_lines.append("")
     
-    # Top accounts by revenue
+    # KEY INSIGHTS
+    context_lines.append("💡 KEY INSIGHTS:")
+    if metrics.get('headcount') and metrics.get('revenue'):
+        rev_per_emp = metrics['revenue'] / (metrics['headcount'] / 1000) if metrics['headcount'] > 0 else 0
+        context_lines.append(f"  Revenue per Employee: ${rev_per_emp:.2f}K")
+    if metrics.get('gpm') and metrics['gpm'] < 5:
+        context_lines.append(f"  ⚠️  ALERT: Low margin ({metrics['gpm']:.2f}%) - review cost structure")
+    elif metrics.get('gpm') and metrics['gpm'] > 20:
+        context_lines.append(f"  ✅ Strong margin ({metrics['gpm']:.2f}%) - healthy profitability")
+    context_lines.append("")
+    
+    # TOP ACCOUNTS ANALYSIS
     if 'Client' in df_cir.columns and 'Revenue USD m' in df_cir.columns:
-        top_acct = df_cir.groupby('Client')['Revenue USD m'].sum().sort_values(ascending=False).head(5)
-        context_lines.append("Top 5 Accounts by Revenue:")
-        context_lines.append(top_acct.round(3).to_string())
+        top_acct = df_cir.groupby('Client')['Revenue USD m'].sum().sort_values(ascending=False)
+        total_rev = top_acct.sum()
+        top_5_rev = top_acct.head(5).sum()
+        concentration = (top_5_rev / total_rev * 100) if total_rev > 0 else 0
+        
+        context_lines.append("📈 REVENUE CONCENTRATION:")
+        context_lines.append(f"  Top 5 accounts generate {concentration:.1f}% of total revenue")
+        context_lines.append("")
+        context_lines.append("🏆 TOP 5 ACCOUNTS BY REVENUE:")
+        for i, (client, rev) in enumerate(top_acct.head(5).items(), 1):
+            pct = (rev / total_rev * 100) if total_rev > 0 else 0
+            context_lines.append(f"  {i}. {client}: ${rev:.3f}M ({pct:.1f}%)")
         context_lines.append("")
     
-    # Revenue by region
+    # REGIONAL BREAKDOWN
     if 'Region' in df_cir.columns and 'Revenue USD m' in df_cir.columns:
-        by_reg = df_cir.groupby('Region')['Revenue USD m'].sum()
-        context_lines.append("Revenue by Region:")
-        context_lines.append(by_reg.round(3).to_string())
+        by_reg = df_cir.groupby('Region')['Revenue USD m'].sum().sort_values(ascending=False)
+        context_lines.append("🌍 REGIONAL DISTRIBUTION:")
+        for region, rev in by_reg.items():
+            pct = (rev / by_reg.sum() * 100)
+            context_lines.append(f"  {region}: ${rev:.3f}M ({pct:.1f}%)")
         context_lines.append("")
     
-    # Headcount by client (all rows are active) - FULL LIST for AI context
+    # STAFFING BY ACCOUNT
     if df_res is not None and 'Client Name' in df_res.columns:
         hc_by_client = df_res.groupby('Client Name').size().sort_values(ascending=False)
-        context_lines.append(f"Headcount by Account (All {len(hc_by_client)} clients):")
-        context_lines.append(hc_by_client.to_string())
+        context_lines.append(f"👥 STAFFING ACROSS {len(hc_by_client)} ACCOUNTS:")
+        for i, (client, hc) in enumerate(hc_by_client.head(10).items(), 1):
+            context_lines.append(f"  {i}. {client}: {hc} employees")
+        if len(hc_by_client) > 10:
+            context_lines.append(f"  ... and {len(hc_by_client) - 10} more accounts")
+        context_lines.append("")
+        context_lines.append("📋 COMPLETE CLIENT LIST:")
+        for client, hc in hc_by_client.items():
+            context_lines.append(f"  • {client}: {hc}")
         context_lines.append("")
     
+    context_lines.append("="*70)
     return "\n".join(context_lines)
 
 def suggest_questions(df_cir):
-    """Suggest questions based on available data"""
+    """Smart suggestions based on available data - VP/SVP focused"""
     suggestions = [
-        "What is total revenue?",
-        "Show top accounts by revenue",
-        "Revenue breakdown by region",
-        "What is headcount by client?",
-        "How many employees at ZS Associates?",
+        # Strategic overview
+        "How are we doing overall? (Portfolio health check)",
+        
+        # Revenue questions
+        "What's driving our revenue? (Account breakdown)",
+        
+        # Risk/Concentration
+        "Are we over-concentrated with any client? (Risk analysis)",
+        
+        # Headcount/Efficiency
+        "Revenue per employee by account? (Efficiency metrics)",
+        
+        # Account specific
+        "Tell me about ZS Associates (Deep dive on largest account)",
+        
+        # Comparisons
+        "Which accounts are underperforming? (Comparative analysis)",
     ]
     
     if 'GPM' in df_cir.columns or 'GP USD m' in df_cir.columns:
-        suggestions.append("What is profit margin by account?")
+        suggestions.append("Profit margins by account - who's most profitable? (Margin analysis)")
     
     if 'Month' in df_cir.columns:
-        suggestions.append("Show revenue by month")
+        suggestions.append("Month-over-month trend - where's the momentum? (Growth analysis)")
     
     return suggestions
+
+def detect_question_type(prompt):
+    """Detect type of question for better handling"""
+    prompt_lower = prompt.lower()
+    
+    question_types = {
+        'strategic': ['how are we', 'overall', 'portfolio', 'status', 'summary', 'snapshot'],
+        'specific_account': ['about', 'for ', 'at ', 'regarding', 'tell me'],
+        'comparison': ['vs ', 'compare', 'better', 'worse', 'vs.', 'against', 'difference'],
+        'trend': ['trend', 'change', 'momentum', 'growth', 'declining', 'improving'],
+        'deep_dive': ['deep dive', 'detail', 'breakdown', 'analyze', 'analysis'],
+        'risk': ['risk', 'concentration', 'exposure', 'vulnerable', 'depend on'],
+    }
+    
+    detected = []
+    for qtype, keywords in question_types.items():
+        if any(kw in prompt_lower for kw in keywords):
+            detected.append(qtype)
+    
+    return detected if detected else ['general']
 
 def get_groq_response(client, messages, max_attempts=3):
     """Try to get Groq response with model fallback"""
@@ -393,10 +500,44 @@ if data_loaded:
                         client = Groq(api_key=groq_api_key)
                         
                         try:
+                            # Expand synonyms for better understanding
+                            synonym_context = expand_synonyms(matched_prompt)
+                            
+                            system_prompt = f"""You are a senior portfolio analysis expert briefing VPs and SVPs on account intelligence.
+
+YOUR ROLE:
+- Analyze portfolio data and provide executive-level insights
+- Answer both broad strategic questions AND detailed deep-dives
+- When given vague questions, provide the most relevant insights AND suggest specific follow-ups
+- Use business language, avoid technical jargon
+- Highlight risks, opportunities, and metrics that matter to leadership
+
+DATA AVAILABLE:
+{dynamic_context}
+
+RESPONSE GUIDELINES:
+1. START with the direct answer to their question
+2. PROVIDE context: why this matters, what it means
+3. INCLUDE comparisons: vs targets, competitors, or previous periods if relevant
+4. HIGHLIGHT outliers: unusually high/low values, concentration risks
+5. END with 2-3 suggested follow-up questions they might want to ask
+
+COMMON QUESTIONS YOU'LL RECEIVE:
+- "How are we doing?" (open-ended - show key metrics + insights)
+- "Tell me about [client]" (specific account deep-dive)
+- "What's our revenue?" (direct metric questions)
+- "Where should we focus?" (strategic recommendations)
+- "Which client is struggling?" (comparative analysis)
+- "What happened?" (period-over-period analysis)
+
+{synonym_context}
+
+Remember: Executive users value INSIGHTS over raw data. Interpret findings and explain implications."""
+                            
                             messages = [
                                 {
                                     "role": "system",
-                                    "content": f"You are a portfolio analysis expert. Answer questions based on this data:\n\n{dynamic_context}"
+                                    "content": system_prompt
                                 },
                                 {"role": "user", "content": matched_prompt}  # Use matched_prompt for accurate client lookup
                             ]
@@ -404,6 +545,21 @@ if data_loaded:
                             answer = get_groq_response(client, messages)
                             st.session_state.messages.append({"role": "assistant", "content": answer})
                             st.markdown(answer)
+                            
+                            # Add follow-up suggestions
+                            st.divider()
+                            st.caption("💡 **Suggested follow-ups:**")
+                            col1, col2, col3 = st.columns(3)
+                            suggested_followups = [
+                                "Show me the trend",
+                                "Deep dive into top account",
+                                "Compare to last month"
+                            ]
+                            for i, followup in enumerate(suggested_followups):
+                                with [col1, col2, col3][i]:
+                                    if st.button(followup, key=f"followup_{i}"):
+                                        st.session_state.messages.append({"role": "user", "content": followup})
+                                        st.rerun()
                             
                         except Exception as e:
                             st.error(f"❌ Model error: {str(e)}")
