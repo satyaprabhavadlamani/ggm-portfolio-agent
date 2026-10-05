@@ -272,39 +272,76 @@ def suggest_questions(df_cir):
     return suggestions
 
 def get_groq_response(client, messages):
-    """Get response from Groq with fallback logic"""
+    """Get response from Groq with fallback logic and detailed error logging"""
+    from datetime import datetime, timedelta
+    
+    # Track request for rate limiting
+    now = datetime.now()
+    st.session_state.groq_requests.append(now)
+    
+    # Clean up old requests (older than 1 minute)
+    one_minute_ago = now - timedelta(minutes=1)
+    st.session_state.groq_requests = [t for t in st.session_state.groq_requests if t > one_minute_ago]
+    
+    requests_in_last_minute = len(st.session_state.groq_requests)
+    
+    # Show rate limit warning if approaching limit
+    if requests_in_last_minute > 25:
+        st.warning(f"⚠️ Rate limit approaching: {requests_in_last_minute}/30 requests in last minute")
+    
+    if requests_in_last_minute >= 30:
+        st.error(f"🚫 Rate limit exceeded: {requests_in_last_minute}/30 requests in last minute\n\nPlease wait 1 minute before asking more questions")
+        return None
+    
     errors = []
     
     for model in GROQ_MODELS:
         try:
+            st.write(f"🔄 Trying model: {model}...")
+            
             response = client.messages.create(
                 model=model,
                 messages=messages,
                 max_tokens=1024,
             )
+            
             if response.content and len(response.content) > 0:
+                st.write(f"✅ Success with {model}")
                 return response.content[0].text
+            else:
+                error_msg = "No content in response"
+                errors.append(f"  • {model}: {error_msg}")
+                st.write(f"⚠️ {model}: {error_msg}")
+                
         except Exception as e:
             error_msg = str(e)
-            errors.append(f"  • {model}: {error_msg}")
+            error_type = type(e).__name__
+            errors.append(f"  • {model}: [{error_type}] {error_msg}")
+            st.write(f"❌ {model} failed: {error_type}")
+            st.write(f"   Details: {error_msg}")
     
     # All models failed - provide diagnostic info
     error_summary = "\n".join(errors) if errors else "Unknown error"
-    return f"""⚠️ **Unable to get response from Groq API**
+    
+    st.error(f"""⚠️ **All Groq models failed**
 
-**Possible causes:**
-1. API key missing or invalid in Streamlit secrets
-2. Groq service temporarily unavailable (check https://status.groq.com)
-3. Rate limit reached (30 requests/min on free tier)
-4. Network connectivity issue
-
-**Failed models:**
+**Error Details:**
 {error_summary}
 
-**Next steps:**
-• Verify Groq API key in Streamlit → Settings → Secrets
-• Wait 1-2 minutes if rate limited
-• Try again in a few moments"""
+**Diagnostics to check:**
+1. Verify API key is correctly set in Streamlit secrets
+2. Check Groq service status: https://status.groq.com/
+3. Verify internet connectivity from Streamlit Cloud
+4. Check if rate limit exceeded (30 req/min)
+5. Verify model names are still valid
+
+**What to do:**
+• Wait 2 minutes and try again
+• If persists, check Groq status page
+• Verify API key format (should start with `gsk_`)
+""")
+    
+    return None
 
 # ===== MAIN APP =====
 
@@ -318,7 +355,57 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "process_followup" not in st.session_state:
     st.session_state.process_followup = None
+if "groq_requests" not in st.session_state:
+    st.session_state.groq_requests = []  # Track timestamps of requests
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔧 Diagnostics")
+
+# Show rate limit status
+if "groq_requests" in st.session_state:
+    from datetime import datetime, timedelta
+    
+    now = datetime.now()
+    one_minute_ago = now - timedelta(minutes=1)
+    requests_in_last_minute = len([t for t in st.session_state.groq_requests if t > one_minute_ago])
+    
+    if requests_in_last_minute == 0:
+        st.sidebar.success(f"📊 Requests (1min): {requests_in_last_minute}/30 ✅")
+    elif requests_in_last_minute < 25:
+        st.sidebar.info(f"📊 Requests (1min): {requests_in_last_minute}/30")
+    elif requests_in_last_minute < 30:
+        st.sidebar.warning(f"📊 Requests (1min): {requests_in_last_minute}/30 ⚠️")
+    else:
+        st.sidebar.error(f"📊 Requests (1min): {requests_in_last_minute}/30 🚫 LIMIT HIT")
+
+# Test Groq Connection
+if st.sidebar.button("🧪 Test Groq Connection"):
+    groq_api_key = st.secrets.get("groq", {}).get("api_key")
+    
+    if not groq_api_key:
+        st.sidebar.error("❌ No Groq API key in secrets")
+    else:
+        try:
+            from groq import Groq
+            client = Groq(api_key=groq_api_key)
+            
+            st.sidebar.info("Testing connection to Groq...")
+            
+            response = client.messages.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": "Say 'Connection successful' in one short sentence"}],
+                max_tokens=50,
+            )
+            
+            if response.content:
+                st.sidebar.success(f"✅ Groq is reachable!\n\nResponse: {response.content[0].text}")
+            else:
+                st.sidebar.error("❌ No response from Groq")
+                
+        except Exception as e:
+            st.sidebar.error(f"❌ Connection failed:\n\n{type(e).__name__}\n\n{str(e)}")
+
+st.sidebar.markdown("---")
 data_source = st.sidebar.radio("Data Source", ["Upload Files", "OneDrive"])
 
 if data_source == "Upload Files":
@@ -454,8 +541,10 @@ GUIDELINES:
                         ]
                         
                         answer = get_groq_response(client, messages)
-                        st.session_state.messages.append({"role": "assistant", "content": answer})
-                        st.markdown(answer)
+                        
+                        if answer:
+                            st.session_state.messages.append({"role": "assistant", "content": answer})
+                            st.markdown(answer)
                         
                         st.divider()
                         st.caption("💡 **Suggested follow-ups:**")
