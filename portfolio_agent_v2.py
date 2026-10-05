@@ -131,9 +131,26 @@ def get_available_metrics(df_cir, df_res):
     
     return metrics
 
-def generate_dynamic_context(df_cir, df_res, metrics):
+def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw=None, selected_month=None):
     """Generate comprehensive executive-level context for AI"""
     context_lines = ["="*70, "PORTFOLIO INTELLIGENCE DASHBOARD", "="*70, ""]
+    
+    # Add historical context if available
+    if df_cir_raw is not None and 'Month' in df_cir_raw.columns:
+        available_months = sorted(df_cir_raw['Month'].unique())
+        context_lines.append(f"📅 DATASET CONTAINS {len(available_months)} MONTHS OF HISTORICAL DATA:")
+        context_lines.append(f"   Available months: {', '.join(map(str, available_months))}")
+        context_lines.append(f"   Currently analyzing: {selected_month if selected_month else 'Latest month'}")
+        
+        # Add month-over-month comparison if applicable
+        if selected_month and len(available_months) > 1:
+            available_months_list = list(available_months)
+            if selected_month in available_months_list:
+                idx = available_months_list.index(selected_month)
+                if idx > 0:
+                    prev_month = available_months_list[idx - 1]
+                    context_lines.append(f"   Can compare to: {prev_month} (previous month)")
+        context_lines.append("")
     
     # EXECUTIVE SUMMARY
     context_lines.append("📊 PORTFOLIO SNAPSHOT:")
@@ -232,6 +249,84 @@ def suggest_questions(df_cir):
     
     return suggestions
 
+def resolve_month_reference(user_query, available_months):
+    """Convert month references in user query to actual month values"""
+    if not available_months:
+        return None
+    
+    month_mapping = {
+        'jan': 'Jan', 'january': 'Jan',
+        'feb': 'Feb', 'february': 'Feb',
+        'mar': 'Mar', 'march': 'Mar',
+        'apr': 'Apr', 'april': 'Apr',
+        'may': 'May',
+        'jun': 'Jun', 'june': 'Jun',
+        'jul': 'Jul', 'july': 'Jul',
+        'aug': 'Aug', 'august': 'Aug',
+        'sep': 'Sep', 'september': 'Sep',
+        'oct': 'Oct', 'october': 'Oct',
+        'nov': 'Nov', 'november': 'Nov',
+        'dec': 'Dec', 'december': 'Dec',
+    }
+    
+    query_lower = user_query.lower()
+    
+    # Check for specific month names
+    for key, month_val in month_mapping.items():
+        if key in query_lower and month_val in available_months:
+            return month_val
+    
+    # Check for "last month"
+    if 'last month' in query_lower and len(available_months) > 1:
+        return available_months[-2]  # Second to last
+    
+    # Check for "previous month"
+    if 'previous month' in query_lower and len(available_months) > 1:
+        return available_months[-2]
+    
+    # Check for "this month" or "current month"
+    if 'this month' in query_lower or 'current month' in query_lower:
+        return available_months[-1]  # Latest month
+    
+    return None
+
+def get_month_comparison(df_cir_raw, current_month, prev_month_name=None):
+    """Calculate previous month comparison for trend analysis"""
+    if df_cir_raw is None or 'Month' not in df_cir_raw.columns:
+        return None
+    
+    available_months = sorted(df_cir_raw['Month'].unique())
+    current_idx = available_months.index(current_month) if current_month in available_months else -1
+    
+    if current_idx <= 0:  # No previous month available
+        return None
+    
+    prev_month = available_months[current_idx - 1]
+    
+    # Filter by circle
+    if 'Circle' in df_cir_raw.columns:
+        df_curr = df_cir_raw[(df_cir_raw['Month'] == current_month) & 
+                             (df_cir_raw['Circle'] == GGM_CIRCLE)]
+        df_prev = df_cir_raw[(df_cir_raw['Month'] == prev_month) & 
+                             (df_cir_raw['Circle'] == GGM_CIRCLE)]
+    else:
+        df_curr = df_cir_raw[df_cir_raw['Month'] == current_month]
+        df_prev = df_cir_raw[df_cir_raw['Month'] == prev_month]
+    
+    if 'Revenue USD m' in df_curr.columns:
+        curr_rev = df_curr['Revenue USD m'].sum()
+        prev_rev = df_prev['Revenue USD m'].sum()
+        growth = ((curr_rev - prev_rev) / prev_rev * 100) if prev_rev > 0 else 0
+        
+        return {
+            'prev_month': prev_month,
+            'prev_revenue': prev_rev,
+            'curr_revenue': curr_rev,
+            'growth_pct': growth
+        }
+    
+    return None
+
 def detect_question_type(prompt):
     """Detect type of question for better handling"""
     prompt_lower = prompt.lower()
@@ -280,6 +375,8 @@ data_source = st.sidebar.radio("Choose source:", ["Upload Files", "OneDrive"])
 
 df_res = None
 df_cir = None
+df_cir_raw = None  # For historical data
+selected_month = None
 data_loaded = False
 
 if data_source == "Upload Files":
@@ -288,9 +385,32 @@ if data_source == "Upload Files":
     
     if circle_file:
         try:
-            df_cir = pd.read_excel(circle_file, sheet_name='Sheet1', header=0)
+            df_cir_raw = pd.read_excel(circle_file, sheet_name='Sheet1', header=0)
             
-            st.sidebar.write(f"📊 Loaded {len(df_cir)} Circle Wise records")
+            st.sidebar.write(f"📊 Loaded {len(df_cir_raw)} Circle Wise records")
+            
+            # Detect available months
+            available_months = []
+            if 'Month' in df_cir_raw.columns:
+                available_months = sorted(df_cir_raw['Month'].unique())
+                st.sidebar.write(f"📅 Available months: {', '.join(map(str, available_months))}")
+                
+                # Month selector
+                selected_month = st.sidebar.selectbox(
+                    "Select month to analyze:",
+                    options=available_months,
+                    index=len(available_months) - 1  # Default to latest month
+                )
+                st.sidebar.write(f"✅ Selected: {selected_month}")
+            else:
+                selected_month = None
+                st.sidebar.warning("⚠️ No Month column found")
+            
+            # Filter by selected month
+            if selected_month:
+                df_cir = df_cir_raw[df_cir_raw['Month'] == selected_month].copy()
+            else:
+                df_cir = df_cir_raw.copy()
             
             # Filter by Circle if column exists
             if 'Circle' in df_cir.columns:
@@ -346,11 +466,20 @@ if data_loaded:
     # Get metrics dynamically
     metrics = get_available_metrics(df_cir, df_res)
     
+    # Calculate month-over-month if available
+    mom_comparison = None
+    if 'df_cir_raw' in locals():
+        mom_comparison = get_month_comparison(df_cir_raw, selected_month)
+    
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Current Revenue", f"${metrics.get('revenue', 0):.3f}M")
     col2.metric("Gross Profit (GP)", f"${metrics.get('profit', 0):.3f}M", f"GPM: {metrics.get('gpm', 0):.2f}%")
     col3.metric("Headcount", metrics.get('headcount', 0), "Active employees")
-    col4.metric("Accounts", metrics.get('accounts', 0))
+    if mom_comparison:
+        growth_str = f"{mom_comparison['growth_pct']:+.1f}% vs {mom_comparison['prev_month']}"
+        col4.metric("MoM Growth", growth_str)
+    else:
+        col4.metric("Accounts", metrics.get('accounts', 0))
     
     # ===== MTD / QTD / YTD SECTION =====
     ytd_rev = ytd_gp = ytd_gpm = 0
@@ -480,8 +609,8 @@ if data_loaded:
         with st.chat_message("assistant"):
             with st.spinner("Analyzing..."):
                 try:
-                    # Generate dynamic context
-                    dynamic_context = generate_dynamic_context(df_cir, df_res, metrics)
+                    # Generate dynamic context with historical data awareness
+                    dynamic_context = generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month)
                     
                     # Add historical context if available
                     if not df_hist.empty:
@@ -515,20 +644,40 @@ YOUR ROLE:
 DATA AVAILABLE:
 {dynamic_context}
 
+TEMPORAL DATA AVAILABLE:
+The dataset contains multiple months of historical data. Users can ask about ANY month.
+You have access to: Revenue, Cost, GP, GPM for EVERY month, EVERY region, EVERY client.
+Enable historical analysis, trends, and comparisons across months.
+
 RESPONSE GUIDELINES:
 1. START with the direct answer to their question
 2. PROVIDE context: why this matters, what it means
-3. INCLUDE comparisons: vs targets, competitors, or previous periods if relevant
-4. HIGHLIGHT outliers: unusually high/low values, concentration risks
+3. INCLUDE comparisons: vs targets, competitors, previous months, regions
+4. HIGHLIGHT outliers: unusually high/low values, concentration risks, trends
 5. END with 2-3 suggested follow-up questions they might want to ask
 
 COMMON QUESTIONS YOU'LL RECEIVE:
 - "How are we doing?" (open-ended - show key metrics + insights)
 - "Tell me about [client]" (specific account deep-dive)
 - "What's our revenue?" (direct metric questions)
+- "How was June?" (historical month queries)
+- "Compare July to June" (month-to-month analysis)
+- "Show trend" (multi-month trends)
 - "Where should we focus?" (strategic recommendations)
 - "Which client is struggling?" (comparative analysis)
 - "What happened?" (period-over-period analysis)
+
+MONTH RESOLUTION:
+- User says "June" → Analyze June data specifically
+- User says "last month" → Compare previous month vs current
+- User says "compare July to June" → Provide month-to-month analysis
+- User says "show trend" → Analyze all available months
+- User says "this month" → Use currently selected month
+- User doesn't specify a month → Analyze currently selected month by default
+
+REMEMBER: You have COMPLETE month-by-month breakdown. No data gaps. 
+Each month shows revenue, profit, margin, and accounts separately.
+You can seamlessly switch between temporal views (monthly, quarterly, YTD).
 
 {synonym_context}
 
