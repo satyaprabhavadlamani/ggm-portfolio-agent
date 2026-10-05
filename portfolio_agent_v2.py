@@ -677,4 +677,5 @@ RESPONSE GUIDELINES:
                         )
 
 else:
-    st.info("📁 Upload Circle Wise data or click 'Load Historical Data' to start")
+    st.info("📁 Upload Circle Wise data or click 'Load Historical Data' to start")#   F o r c e   r e d e p l o y  
+ 
