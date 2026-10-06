@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from fuzzywuzzy import fuzz
+
 from local_folder_loader import (
     load_monthly_data_from_folder,
     get_available_months,
@@ -153,6 +155,118 @@ def get_column_explanations(column_map):
     return "\n".join(f"- {e}" for e in explanations) if explanations else ""
 
 
+def identify_bench_resources(df_res, column_map):
+    """
+    Identify bench resources: where client/account field contains 'bench' (case-insensitive).
+    Bench resources are allocated to internal bench, not active client accounts.
+    Returns (active_res_df, bench_res_df) - two dataframes separated by bench status.
+    """
+    if df_res is None or df_res.empty:
+        return df_res, pd.DataFrame()
+    
+    client_col = column_map.get('res_client')
+    if not client_col or client_col not in df_res.columns:
+        return df_res, pd.DataFrame()
+    
+    df_res = df_res.copy()
+    is_bench = df_res[client_col].astype(str).str.lower().str.contains('bench', na=False)
+    
+    return df_res[~is_bench].copy(), df_res[is_bench].copy()
+
+
+def validate_client_matching(df_cir, df_res, column_map, log=None, fuzzy_threshold=85):
+    """
+    Validate that client names in revenue file match resource file (with fuzzy matching).
+    Returns (matched_clients, revenue_only, resource_only) for data quality checks.
+    
+    Fuzzy matching: if a revenue client is >=85% similar to a resource client, they're considered matched.
+    """
+    log = log if log is not None else []
+    
+    client_cir_col = column_map.get('client')
+    client_res_col = column_map.get('res_client')
+    
+    if not client_cir_col or not client_res_col:
+        return set(), set(), set()
+    
+    if client_cir_col not in df_cir.columns or client_res_col not in df_res.columns:
+        return set(), set(), set()
+    
+    # Get unique clients from each source (strip whitespace for comparison)
+    revenue_clients = set(df_cir[client_cir_col].astype(str).str.strip().unique())
+    resource_clients = set(df_res[client_res_col].astype(str).str.strip().unique())
+    
+    # Remove NaN/None
+    revenue_clients = {c for c in revenue_clients if c and c.lower() != 'nan'}
+    resource_clients = {c for c in resource_clients if c and c.lower() != 'nan'}
+    
+    # Exact matches first
+    matched = revenue_clients & resource_clients
+    revenue_unmatched = revenue_clients - resource_clients
+    resource_unmatched = resource_clients - matched
+    
+    # Fuzzy matching on unmatched clients
+    fuzzy_matched = {}
+    for rev_client in revenue_unmatched.copy():
+        for res_client in resource_unmatched.copy():
+            similarity = fuzz.token_set_ratio(rev_client.lower(), res_client.lower())
+            if similarity >= fuzzy_threshold:
+                fuzzy_matched[rev_client] = res_client
+                revenue_unmatched.discard(rev_client)
+                resource_unmatched.discard(res_client)
+                matched.add(rev_client)
+                break
+    
+    if fuzzy_matched:
+        matches_str = ", ".join([f"'{k}' ≈ '{v}'" for k, v in sorted(fuzzy_matched.items())[:3]])
+        log.append(f"✓ Fuzzy matched ({fuzzy_threshold}% similarity): {matches_str}" + 
+                   (f" (+{len(fuzzy_matched)-3} more)" if len(fuzzy_matched) > 3 else ""))
+    
+    if revenue_unmatched:
+        log.append(f"⚠️ In revenue but not in resource: {', '.join(sorted(revenue_unmatched)[:5])}" + 
+                   (f" (+{len(revenue_unmatched)-5} more)" if len(revenue_unmatched) > 5 else ""))
+    if resource_unmatched:
+        log.append(f"⚠️ In resource but not in revenue: {', '.join(sorted(resource_unmatched)[:5])}" + 
+                   (f" (+{len(resource_unmatched)-5} more)" if len(resource_unmatched) > 5 else ""))
+    
+    return matched, revenue_unmatched, resource_unmatched
+
+
+def apply_region_overrides(df_cir, column_map):
+    """
+    Apply hardcoded region mappings for specific clients.
+    - Digiterre → Europe
+    - SFI → Europe
+    Ignores the source region/country and always uses the override.
+    """
+    if df_cir is None or df_cir.empty:
+        return df_cir
+    
+    client_col = column_map.get('client')
+    region_col = column_map.get('region')
+    
+    if not client_col or not region_col:
+        return df_cir
+    
+    if client_col not in df_cir.columns or region_col not in df_cir.columns:
+        return df_cir
+    
+    df_cir = df_cir.copy()
+    
+    # Apply region overrides for specific clients
+    overrides = {
+        'Digiterre': 'Europe',
+        'SFI': 'Europe',
+    }
+    
+    for client_name, target_region in overrides.items():
+        mask = df_cir[client_col].astype(str).str.strip() == client_name
+        if mask.any():
+            df_cir.loc[mask, region_col] = target_region
+    
+    return df_cir
+
+
 def get_available_metrics(df_cir, df_res, column_map):
     """Headline numbers for the selected month. df_cir / df_res must already be month-filtered."""
     def total(key):
@@ -162,11 +276,20 @@ def get_available_metrics(df_cir, df_res, column_map):
     metrics = {'revenue': total('revenue'), 'cost': total('cost'), 'profit': total('profit')}
     metrics['gpm'] = (metrics['profit'] / metrics['revenue'] * 100) if metrics['revenue'] else 0.0
 
-    headcount = 0
-    if df_res is not None and len(df_res) > 0:
+    # Separate active resources from bench resources
+    df_res_active, df_res_bench = identify_bench_resources(df_res, column_map)
+    
+    headcount_active = 0
+    headcount_bench = 0
+    if df_res_active is not None and len(df_res_active) > 0:
         emp = column_map.get('res_emp')
-        headcount = int(df_res[emp].nunique()) if emp and emp in df_res.columns else len(df_res)
-    metrics['headcount'] = headcount
+        headcount_active = int(df_res_active[emp].nunique()) if emp and emp in df_res_active.columns else len(df_res_active)
+    if df_res_bench is not None and len(df_res_bench) > 0:
+        emp = column_map.get('res_emp')
+        headcount_bench = int(df_res_bench[emp].nunique()) if emp and emp in df_res_bench.columns else len(df_res_bench)
+    
+    metrics['headcount'] = headcount_active
+    metrics['headcount_bench'] = headcount_bench
 
     client = column_map.get('client')
     metrics['accounts'] = int(df_cir[client].nunique()) if client and client in df_cir.columns else 0
@@ -360,7 +483,12 @@ def _read_uploads(files, kind, log):
     """Read uploaded Excel files into one frame; month comes from the file name."""
     by_month = {}
     for f in files or []:
-        df = pd.read_excel(f, sheet_name=0, header=0)
+        # Read by sheet name "Sheet1" (source of truth), with fallback to index 0
+        try:
+            df = pd.read_excel(f, sheet_name='Sheet1', header=0)
+        except ValueError:
+            log.append(f"{kind}: sheet 'Sheet1' not found in '{f.name}', using first sheet...")
+            df = pd.read_excel(f, sheet_name=0, header=0)
         df.columns = [str(c).strip() for c in df.columns]
         month = infer_month_from_text(f.name) or 'Uploaded'
         if month in by_month:
@@ -465,6 +593,7 @@ selected_month = st.sidebar.selectbox("Select month for dashboard:", options=mon
 st.sidebar.success(f"✅ Data loaded - months: {', '.join(months)}")
 
 df_cir = cir_raw[cir_raw["Month"] == selected_month].copy()
+df_cir = apply_region_overrides(df_cir, column_map)  # Apply Digiterre/SFI region mapping
 df_res = res_raw[res_raw["Month"] == selected_month].copy() if "Month" in res_raw.columns else res_raw
 
 if not column_map.get("revenue"):
@@ -480,8 +609,11 @@ models = list(get_secret("groq", "models") or DEFAULT_MODELS)
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Revenue", f"${metrics['revenue']:.3f}M")
 col2.metric("Gross Profit", f"${metrics['profit']:.3f}M", f"GPM: {metrics['gpm']:.2f}%")
-col3.metric("Headcount", metrics["headcount"], "Active")
-col4.metric("Accounts", metrics["accounts"])
+col3.metric("Active Headcount", metrics["headcount"])
+if metrics.get('headcount_bench', 0) > 0:
+    col4.metric("Bench Headcount", metrics.get("headcount_bench", 0))
+else:
+    col4.metric("Accounts", metrics["accounts"])
 
 with st.expander("📊 Charts", expanded=True):
     try:
@@ -530,6 +662,17 @@ with st.expander("📋 Detected columns & data checks"):
     st.dataframe(chk.reindex(months))
     st.caption(f"Circle filter ('{CIRCLE_NAME}') applied: {'yes' if circle_filtered else 'NO - no matching Circle column/value, all rows used'}")
     st.caption(f"'Total' summary rows removed: {dropped_rows}")
+    
+    # Client matching validation
+    validation_log = []
+    matched, rev_only, res_only = validate_client_matching(cir_raw, res_raw, column_map, validation_log)
+    st.caption(f"**Client matching:** {len(matched)} match both files")
+    if validation_log:
+        st.warning("⚠️ Client name mismatches detected:")
+        for line in validation_log:
+            st.caption(f"• {line}")
+    
+    st.subheader("Data Quality Log")
     for line in data.get("log", []):
         st.caption(f"• {line}")
 
@@ -578,10 +721,11 @@ if prompt:
 RULES
 1. Answer ONLY from the snapshot and DATA TABLES above. Quote figures exactly as shown (USD millions; GPM as %).
 2. Do NOT calculate totals, averages, growth rates or rankings yourself. Use the pre-computed columns (e.g. Chg_pct) and the order the tables are sorted in. If a figure you need is not in the tables, say it is not available and name the data that would be needed.
-3. Translate VP wording to metrics (sales -> revenue, GP -> profit, margin -> GPM, team -> headcount, client/customer -> account).
-4. Tables marked "top N of M" are truncated - make no claims about accounts that are not shown.
-5. Client names in the headcount data may be spelled differently from the financial data - flag a mismatch rather than guess.
-6. Be concise and executive-ready: lead with the answer, add 2-4 supporting points, finish with one suggested follow-up.{hint_line}"""
+3. Do NOT assume, guess, or estimate any numbers. All figures must come directly from the tables. If you cannot find a number in the data, say "not available in the current data" rather than approximating or deriving unstated values.
+4. Translate VP wording to metrics (sales -> revenue, GP -> profit, margin -> GPM, team -> headcount, client/customer -> account).
+5. Tables marked "top N of M" are truncated - make no claims about accounts that are not shown.
+6. Client names in the headcount data may be spelled differently from the financial data - flag a mismatch rather than guess.
+7. Be concise and executive-ready: lead with the answer, add 2-4 supporting points, finish with one suggested follow-up.{hint_line}"""
 
                     history = [{"role": m["role"], "content": m["content"]}
                                for m in st.session_state.messages[-HISTORY_TURNS:]]
