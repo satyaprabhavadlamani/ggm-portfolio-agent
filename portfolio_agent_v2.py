@@ -183,6 +183,10 @@ def validate_client_matching(df_cir, df_res, column_map, log=None, fuzzy_thresho
     """
     log = log if log is not None else []
     
+    # Handle None or empty dataframes
+    if df_cir is None or df_res is None or len(df_cir) == 0 or len(df_res) == 0:
+        return set(), set(), set()
+    
     client_cir_col = column_map.get('client')
     client_res_col = column_map.get('res_client')
     
