@@ -200,9 +200,9 @@ def validate_client_matching(df_cir, df_res, column_map, log=None, fuzzy_thresho
     revenue_clients = set(df_cir[client_cir_col].astype(str).str.strip().unique())
     resource_clients = set(df_res[client_res_col].astype(str).str.strip().unique())
     
-    # Remove NaN/None
-    revenue_clients = {c for c in revenue_clients if c and c.lower() != 'nan'}
-    resource_clients = {c for c in resource_clients if c and c.lower() != 'nan'}
+    # Remove NaN/None (ensure string conversion to avoid float.lower() error)
+    revenue_clients = {c for c in revenue_clients if c and str(c).lower() != 'nan'}
+    resource_clients = {c for c in resource_clients if c and str(c).lower() != 'nan'}
     
     # Exact matches first
     matched = revenue_clients & resource_clients
@@ -213,7 +213,7 @@ def validate_client_matching(df_cir, df_res, column_map, log=None, fuzzy_thresho
     fuzzy_matched = {}
     for rev_client in revenue_unmatched.copy():
         for res_client in resource_unmatched.copy():
-            similarity = fuzz.token_set_ratio(rev_client.lower(), res_client.lower())
+            similarity = fuzz.token_set_ratio(str(rev_client).lower(), str(res_client).lower())
             if similarity >= fuzzy_threshold:
                 fuzzy_matched[rev_client] = res_client
                 revenue_unmatched.discard(rev_client)
