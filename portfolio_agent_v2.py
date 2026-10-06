@@ -26,7 +26,7 @@ from local_folder_loader import (
 CIRCLE_NAME = "Data and Insights"      # value of the 'Circle' column to keep
 YEAR = "2026"
 DEFAULT_BASE_PATH = r"C:\Users\satyaprabha.v\OneDrive - ascendion\Documents\GGM Data\GGM Portfolio Analytics"
-DEFAULT_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]  # verify against Groq's current model list
+DEFAULT_MODELS = ["llama-3.1-8b-instant", "openai/gpt-oss-20b"]  # verify against Groq's current model list
 TOP_N = 20          # max rows per table sent to the model (keeps prompts within Groq token limits)
 HISTORY_TURNS = 6   # recent chat messages sent to the model so follow-ups keep context
 
