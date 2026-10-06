@@ -1,4 +1,16 @@
-﻿secrets.toml
+﻿# Secrets - never commit
+.streamlit/secrets.toml
+secrets.toml
+.env
+
+# Confidential account data - never commit
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+GGM Data/
+
+# Python
 __pycache__/
 *.pyc
-.streamlit/secrets.toml
+.venv/
