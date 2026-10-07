@@ -271,13 +271,15 @@ def apply_region_overrides(df, column_map, data_type='cir'):
     df = df.copy()
     
     # Apply region overrides for specific clients
+    # CRITICAL: These clients MUST always map to Europe regardless of source data
     overrides = {
         'Digiterre': 'Europe',
         'SFI': 'Europe',
     }
     
     for client_name, target_region in overrides.items():
-        mask = df[client_col].astype(str).str.strip() == client_name
+        # Robust matching: handle NaN, None, floats, case variations
+        mask = df[client_col].astype(str).str.strip().str.lower() == client_name.lower()
         if mask.any():
             df.loc[mask, region_col] = target_region
     
@@ -373,6 +375,12 @@ def build_data_tables(df_cir_raw, df_res_raw, selected_month, column_map, top_n=
             pv = pv.sort_values(selected_month, ascending=False).head(top_n).reset_index()
             parts.append(f"TABLE 4 - REVENUE USD m BY CLIENT ACROSS MONTHS (top {top_n} by {selected_month})\n" + _csv(pv))
 
+    # 4b. CLIENT-TO-REGION MAPPING (NEW) - Essential for answering "which clients are in [region]?"
+    if client and region and client in cur.columns and region in cur.columns:
+        client_region_map = cur[[client, region]].drop_duplicates().sort_values(client)
+        if not client_region_map.empty:
+            parts.append(f"TABLE 4B - CLIENT-TO-REGION MAPPING ({selected_month}; use to answer 'which clients are in X region')\n" + _csv(client_region_map))
+
     # 5-7. Headcount
     if df_res_raw is not None and len(df_res_raw) > 0 and 'Month' in df_res_raw.columns:
         emp = column_map.get('res_emp')
@@ -450,6 +458,16 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month
     lines += ["VP TERMINOLOGY:"]
     lines += [f"- {metric}: {', '.join(syns[:5])}" for metric, syns in SYNONYM_MAP.items()]
     lines += [""]
+    
+    # Add explicit context about Europe clients (helps answer "which clients in Europe?")
+    if df_cir is not None and not df_cir.empty and column_map and column_map.get('client') and column_map.get('region'):
+        client_col = column_map.get('client')
+        region_col = column_map.get('region')
+        if client_col in df_cir.columns and region_col in df_cir.columns:
+            europe_clients = df_cir[df_cir[region_col].astype(str).str.lower() == 'europe'][client_col].unique()
+            if len(europe_clients) > 0:
+                lines += [f"EUROPE REGION CLIENTS (for {selected_month}): {', '.join(sorted(europe_clients))}"]
+                lines += [""]
 
     if data_tables:
         lines += ["DATA TABLES (pre-computed with pandas - the only source for figures):", data_tables, ""]
@@ -781,9 +799,10 @@ RULES
 2. Do NOT calculate totals, averages, growth rates or rankings yourself. Use the pre-computed columns (e.g. Chg_pct) and the order the tables are sorted in. If a figure you need is not in the tables, say it is not available and name the data that would be needed.
 3. Do NOT assume, guess, or estimate any numbers. All figures must come directly from the tables. If you cannot find a number in the data, say "not available in the current data" rather than approximating or deriving unstated values.
 4. Translate VP wording to metrics (sales -> revenue, GP -> profit, margin -> GPM, team -> headcount, client/customer -> account).
-5. Tables marked "top N of M" are truncated - make no claims about accounts that are not shown.
-6. Client names in the headcount data may be spelled differently from the financial data - flag a mismatch rather than guess.
-7. Be concise and executive-ready: lead with the answer, add 2-4 supporting points, finish with one suggested follow-up.{hint_line}"""
+5. For questions about "clients in [region]" (e.g., "which clients are in Europe?"), use TABLE 4B (CLIENT-TO-REGION MAPPING) to identify relevant clients, then look up their revenue in TABLE 2 (BY CLIENT) or TABLE 4 (ACROSS MONTHS).
+6. Tables marked "top N of M" are truncated - make no claims about accounts that are not shown.
+7. Client names in the headcount data may be spelled differently from the financial data - flag a mismatch rather than guess.
+8. Be concise and executive-ready: lead with the answer, add 2-4 supporting points, finish with one suggested follow-up.{hint_line}"""
 
                     history = [{"role": m["role"], "content": m["content"]}
                                for m in st.session_state.messages[-HISTORY_TURNS:]]
