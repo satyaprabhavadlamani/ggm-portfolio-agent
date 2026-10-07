@@ -650,7 +650,12 @@ cir_raw, dropped_rows = clean_circle_df(cir_raw, column_map)
 cir_raw = apply_region_overrides(cir_raw, column_map, data_type='cir')
 res_raw = apply_region_overrides(res_raw, column_map, data_type='res')
 
-# CRITICAL DATA VALIDATION - Show exactly what data is being used
+months = get_available_months(cir_raw)
+selected_month = st.sidebar.selectbox("Select month for dashboard:", options=months,
+                                      index=len(months) - 1, key="month_" + "_".join(months))
+st.sidebar.success(f"✅ Data loaded - months: {', '.join(months)}")
+
+# CRITICAL DATA VALIDATION - Show exactly what data is being used (AFTER month selector)
 with st.expander("🔍 DATA VALIDATION - Exact Figures for Selected Month"):
     debug_lines = []
     debug_lines.append(f"✓ Columns: client='{column_map.get('client')}', region='{column_map.get('region')}', revenue='{column_map.get('revenue')}'")
@@ -676,11 +681,6 @@ with st.expander("🔍 DATA VALIDATION - Exact Figures for Selected Month"):
     
     for line in debug_lines:
         st.caption(line)
-
-months = get_available_months(cir_raw)
-selected_month = st.sidebar.selectbox("Select month for dashboard:", options=months,
-                                      index=len(months) - 1, key="month_" + "_".join(months))
-st.sidebar.success(f"✅ Data loaded - months: {', '.join(months)}")
 
 df_cir = cir_raw[cir_raw["Month"] == selected_month].copy()
 df_res = res_raw[res_raw["Month"] == selected_month].copy() if "Month" in res_raw.columns else res_raw
