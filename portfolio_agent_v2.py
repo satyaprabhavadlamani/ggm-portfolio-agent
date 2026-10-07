@@ -1,4 +1,6 @@
+import difflib
 import os
+import re
 import traceback
 
 # Corporate networks often re-sign HTTPS traffic with a company certificate that Python
@@ -14,12 +16,27 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from fuzzywuzzy import fuzz
+# Fuzzy matching: rapidfuzz (maintained, prebuilt wheels) -> fuzzywuzzy -> difflib (always available)
+try:
+    from rapidfuzz import fuzz as _fuzz
+except ImportError:
+    try:
+        from fuzzywuzzy import fuzz as _fuzz
+    except ImportError:
+        _fuzz = None
 
 from local_folder_loader import (
-    load_monthly_data_from_folder,
+    SOURCE_COL,
+    YEAR_COL,
+    apply_circle_filter,
+    assign_months,
+    find_months_in_text,
     get_available_months,
     infer_month_from_text,
+    infer_year_from_text,
+    load_monthly_data_from_folder,
+    month_mismatches,
+    select_authoritative,
 )
 
 # ----------------------------------------------------------------------------
@@ -31,6 +48,13 @@ DEFAULT_BASE_PATH = r"C:\Users\satyaprabha.v\OneDrive - ascendion\Documents\GGM 
 DEFAULT_MODELS = ["llama-3.1-8b-instant", "openai/gpt-oss-20b"]  # verify against Groq's current model list
 TOP_N = 20          # max rows per table sent to the model (keeps prompts within Groq token limits)
 HISTORY_TURNS = 6   # recent chat messages sent to the model so follow-ups keep context
+REGION_CLIENT_CAP = 40      # max clients listed per region in TABLE 4B (also scaled down with top_n)
+MAX_OUTPUT_TOKENS = 1024    # max_tokens requested from the model
+# Total tokens (prompt + reply) one request may use. ASSUMPTION - not verified against Groq's current
+# per-model limits. Override with [groq] token_budget in secrets or the GROQ_TOKEN_BUDGET env var.
+MODEL_TOKEN_BUDGET = 6000
+CHARS_PER_TOKEN = 3.0       # conservative estimate for number-heavy CSV text
+YEARS = "2026"              # year folder(s) to load: "2026", "2025,2026" or "all" (override: [paths] years / GGM_YEARS)
 
 SYNONYM_MAP = {
     'revenue': ['sales', 'top line', 'topline', 'income', 'earnings', 'throughput', 'billing', 'invoiced', 'turnover', 'receipts'],
@@ -129,6 +153,47 @@ def clean_circle_df(df, column_map):
     return df, dropped
 
 
+def normalize_labels(df, columns):
+    """
+    Clean text labels (client / region) BEFORE any grouping, so 'Europe' and 'Europe ' (or
+    'Bank of America' / 'Bank Of America') are one group, not two.
+      - trims, collapses repeated spaces, turns non-breaking spaces into spaces
+      - merges case variants into the most frequent spelling (ties: alphabetical)
+      - blank strings become missing values
+    Returns (df, merged) where merged = {column: number of spelling variants merged away}.
+    """
+    merged = {}
+    if df is None or df.empty:
+        return df, merged
+    df = df.copy()
+    for col in columns:
+        if not col or col not in df.columns:
+            continue
+        s = df[col]
+        cleaned = (s.astype(str)
+                    .str.replace('\u00a0', ' ', regex=False)
+                    .str.replace(r'\s+', ' ', regex=True)
+                    .str.strip())
+        cleaned = cleaned.where(s.notna() & (cleaned != ''), np.nan)
+        valid = cleaned.notna()
+        if not valid.any():
+            continue
+        key = cleaned.str.lower()
+        pairs = pd.DataFrame({'k': key[valid], 'v': cleaned[valid]})
+
+        def _most_common(x):
+            vc = x.value_counts()
+            return vc[vc == vc.max()].index.min()
+
+        canon = pairs.groupby('k')['v'].agg(_most_common)
+        before = int(s.dropna().astype(str).nunique())
+        df[col] = key.map(canon)
+        after = int(df[col].nunique())
+        if before > after:
+            merged[col] = before - after
+    return df, merged
+
+
 def get_column_explanations(column_map):
     """Generate AI-readable explanations of detected columns"""
     explanations = []
@@ -155,9 +220,13 @@ def get_column_explanations(column_map):
     return "\n".join(f"- {e}" for e in explanations) if explanations else ""
 
 
+# 'bench' as a whole word only - so "Bench", "Internal Bench", "Bench-Pool" match but "Benchmark Corp" does not
+_BENCH_RE = re.compile(r'(?<![a-z])bench(?![a-z])', re.IGNORECASE)
+
+
 def identify_bench_resources(df_res, column_map):
     """
-    Identify bench resources: where client/account field contains 'bench' (case-insensitive).
+    Identify bench resources: where client/account field contains the whole word 'bench' (case-insensitive).
     Bench resources are allocated to internal bench, not active client accounts.
     Returns (active_res_df, bench_res_df) - two dataframes separated by bench status.
     """
@@ -169,70 +238,147 @@ def identify_bench_resources(df_res, column_map):
         return df_res, pd.DataFrame()
     
     df_res = df_res.copy()
-    is_bench = df_res[client_col].astype(str).str.lower().str.contains('bench', na=False)
+    is_bench = df_res[client_col].astype(str).str.contains(_BENCH_RE, na=False)
     
     return df_res[~is_bench].copy(), df_res[is_bench].copy()
 
 
-def validate_client_matching(df_cir, df_res, column_map, log=None, fuzzy_threshold=85):
+_LEGAL_SUFFIXES = {
+    'the', 'ltd', 'limited', 'inc', 'incorporated', 'llc', 'llp', 'lp', 'plc', 'corp', 'corporation',
+    'co', 'company', 'gmbh', 'ag', 'sa', 'nv', 'bv', 'pvt', 'private',
+}
+
+
+def _name_key(name):
+    """Exact-match key: whitespace-collapsed, lower-case."""
+    return re.sub(r'\s+', ' ', str(name)).strip().lower()
+
+
+def _name_tokens(name):
+    """Fuzzy-match form: lower-case, punctuation removed, legal suffixes (Ltd, Inc, ...) dropped."""
+    t = re.sub(r'[^a-z0-9]+', ' ', str(name).lower().replace('&', ' and '))
+    return ' '.join(w for w in t.split() if w not in _LEGAL_SUFFIXES)
+
+
+def _token_sort_score(a, b):
+    """Order-insensitive similarity 0-100. Extra words LOWER the score ('AXA' vs 'AXA XL' ~ 67)."""
+    if _fuzz is not None:
+        return _fuzz.token_sort_ratio(a, b)
+    ta, tb = ' '.join(sorted(a.split())), ' '.join(sorted(b.split()))
+    return int(round(difflib.SequenceMatcher(None, ta, tb).ratio() * 100))
+
+
+def _token_set_score(a, b):
+    """Lenient score: 100 when one name's words are a subset of the other's. Used ONLY to suggest reviews."""
+    if _fuzz is not None:
+        return _fuzz.token_set_ratio(a, b)
+    sa, sb = set(a.split()), set(b.split())
+    if sa and sb and (sa <= sb or sb <= sa):
+        return 100
+    return _token_sort_score(a, b)
+
+
+def validate_client_matching(df_cir, df_res, column_map, log=None, fuzzy_threshold=85, review_threshold=90):
     """
-    Validate that client names in revenue file match resource file (with fuzzy matching).
+    Validate that client names in the revenue file match the resource file.
     Returns (matched_clients, revenue_only, resource_only) for data quality checks.
-    
-    Fuzzy matching: if a revenue client is >=85% similar to a resource client, they're considered matched.
+
+    1. Exact match (case/whitespace-insensitive).
+    2. Fuzzy auto-match: token_sort_ratio >= fuzzy_threshold on cleaned names, BEST pair first,
+       one-to-one, deterministic. Subset names ("AXA" vs "AXA XL") do NOT auto-match.
+    3. Lenient candidates (token_set_ratio >= review_threshold) are only SUGGESTED in the log.
+    Bench rows are not clients and are excluded from the resource side.
     """
     log = log if log is not None else []
-    
+
     # Handle None or empty dataframes
     if df_cir is None or df_res is None or len(df_cir) == 0 or len(df_res) == 0:
         return set(), set(), set()
-    
+
     client_cir_col = column_map.get('client')
     client_res_col = column_map.get('res_client')
-    
+
     if not client_cir_col or not client_res_col:
         return set(), set(), set()
-    
+
     if client_cir_col not in df_cir.columns or client_res_col not in df_res.columns:
         return set(), set(), set()
-    
-    # Get unique clients from each source (strip whitespace for comparison)
-    revenue_clients = set(df_cir[client_cir_col].astype(str).str.strip().unique())
-    resource_clients = set(df_res[client_res_col].astype(str).str.strip().unique())
-    
-    # Remove NaN/None (ensure string conversion to avoid float.lower() error)
-    revenue_clients = {c for c in revenue_clients if c and str(c).lower() != 'nan'}
-    resource_clients = {c for c in resource_clients if c and str(c).lower() != 'nan'}
-    
-    # Exact matches first
-    matched = revenue_clients & resource_clients
-    revenue_unmatched = revenue_clients - resource_clients
-    resource_unmatched = resource_clients - matched
-    
-    # Fuzzy matching on unmatched clients
+
+    df_res_active, _bench = identify_bench_resources(df_res, column_map)
+
+    def _by_key(series):
+        out = {}
+        for v in series.dropna().astype(str).str.strip().unique():
+            if v and v.lower() != 'nan':
+                out.setdefault(_name_key(v), v)
+        return out
+
+    rev_by_key = _by_key(df_cir[client_cir_col])
+    res_by_key = _by_key(df_res_active[client_res_col])
+
+    # 1. Exact matches
+    exact = set(rev_by_key) & set(res_by_key)
+    matched = {rev_by_key[k] for k in exact}
+    revenue_unmatched = {v for k, v in rev_by_key.items() if k not in exact}
+    resource_unmatched = {v for k, v in res_by_key.items() if k not in exact}
+
+    # 2. Fuzzy auto-match: score every pair, take best first, each name used at most once
+    rev_tok = {c: _name_tokens(c) for c in revenue_unmatched}
+    res_tok = {c: _name_tokens(c) for c in resource_unmatched}
+    pairs = []
+    for rc in sorted(revenue_unmatched):
+        for sc in sorted(resource_unmatched):
+            if rev_tok[rc] and res_tok[sc]:
+                ta, tb = set(rev_tok[rc].split()), set(res_tok[sc].split())
+                if ta < tb or tb < ta:      # one name just has EXTRA words ('Santander' / 'Santander UK'):
+                    continue                # possibly a different entity -> suggested for review, never auto-matched
+                pairs.append((_token_sort_score(rev_tok[rc], res_tok[sc]), rc, sc))
+    pairs.sort(key=lambda p: (-p[0], p[1], p[2]))
+
     fuzzy_matched = {}
-    for rev_client in revenue_unmatched.copy():
-        for res_client in resource_unmatched.copy():
-            similarity = fuzz.token_set_ratio(str(rev_client).lower(), str(res_client).lower())
-            if similarity >= fuzzy_threshold:
-                fuzzy_matched[rev_client] = res_client
-                revenue_unmatched.discard(rev_client)
-                resource_unmatched.discard(res_client)
-                matched.add(rev_client)
-                break
-    
+    used_res = set()
+    for score, rc, sc in pairs:
+        if score < fuzzy_threshold:
+            break
+        if rc in fuzzy_matched or sc in used_res:
+            continue
+        fuzzy_matched[rc] = (sc, score)
+        used_res.add(sc)
+
+    for rc, (sc, _score) in fuzzy_matched.items():
+        revenue_unmatched.discard(rc)
+        resource_unmatched.discard(sc)
+        matched.add(rc)
+
+    # 3. Suggest (never auto-apply) lenient candidates among what is still unmatched
+    review = {}
+    for rc in sorted(revenue_unmatched):
+        best = None
+        for sc in sorted(resource_unmatched):
+            if rev_tok[rc] and res_tok[sc]:
+                sc_score = _token_set_score(rev_tok[rc], res_tok[sc])
+                if sc_score >= review_threshold and (best is None or sc_score > best[1]):
+                    best = (sc, sc_score)
+        if best:
+            review[rc] = best
+
     if fuzzy_matched:
-        matches_str = ", ".join([f"'{k}' ≈ '{v}'" for k, v in sorted(fuzzy_matched.items())[:3]])
-        log.append(f"✓ Fuzzy matched ({fuzzy_threshold}% similarity): {matches_str}" + 
-                   (f" (+{len(fuzzy_matched)-3} more)" if len(fuzzy_matched) > 3 else ""))
-    
+        items = sorted(fuzzy_matched.items())
+        matches_str = ", ".join([f"'{k}' ≈ '{v[0]}' ({v[1]:.0f}%)" for k, v in items[:3]])
+        log.append(f"✓ Fuzzy matched (≥{fuzzy_threshold}% name similarity): {matches_str}" +
+                   (f" (+{len(items)-3} more)" if len(items) > 3 else ""))
+    if review:
+        items = sorted(review.items())
+        review_str = ", ".join([f"'{k}' ? '{v[0]}'" for k, v in items[:5]])
+        log.append(f"🔎 Possible matches to review (NOT auto-matched): {review_str}" +
+                   (f" (+{len(items)-5} more)" if len(items) > 5 else ""))
     if revenue_unmatched:
-        log.append(f"⚠️ In revenue but not in resource: {', '.join(sorted(revenue_unmatched)[:5])}" + 
+        log.append(f"⚠️ In revenue but not in resource: {', '.join(sorted(revenue_unmatched)[:5])}" +
                    (f" (+{len(revenue_unmatched)-5} more)" if len(revenue_unmatched) > 5 else ""))
     if resource_unmatched:
-        log.append(f"⚠️ In resource but not in revenue: {', '.join(sorted(resource_unmatched)[:5])}" + 
+        log.append(f"⚠️ In resource but not in revenue: {', '.join(sorted(resource_unmatched)[:5])}" +
                    (f" (+{len(resource_unmatched)-5} more)" if len(resource_unmatched) > 5 else ""))
-    
+
     return matched, revenue_unmatched, resource_unmatched
 
 
@@ -269,7 +415,7 @@ def apply_region_overrides(df, column_map, data_type='cir'):
         return df
     
     df = df.copy()
-    
+
     # Apply region overrides for specific clients
     # CRITICAL: These MUST always map to Europe regardless of source data
     overrides = {
@@ -340,21 +486,19 @@ def _csv(df):
     return df.round(3).to_csv(index=False).strip()
 
 
-def build_data_tables(df_cir_raw, df_res_raw, selected_month, column_map, top_n=TOP_N):
-    """All figures the model is allowed to quote, computed with pandas."""
-    parts = []
-    months = get_available_months(df_cir_raw)
-    cur = df_cir_raw[df_cir_raw['Month'] == selected_month]
-    client, region, rev = column_map.get('client'), column_map.get('region'), column_map.get('revenue')
+def _hc(df, emp):
+    """Distinct employees (or row count when there is no employee-id column)."""
+    if df is None or len(df) == 0:
+        return 0
+    return int(df[emp].nunique()) if emp and emp in df.columns else len(df)
 
-    # 1. Totals by month
-    trend = _agg(df_cir_raw, 'Month', column_map)
-    if not trend.empty:
-        trend['Month'] = pd.Categorical(trend['Month'], categories=months, ordered=True)
-        trend = trend.sort_values('Month')
-        parts.append("TABLE 1 - TOTALS BY MONTH (all loaded months; GPM_pct = GP / Revenue)\n" + _csv(trend))
 
-    # 2 & 3. Selected month by client / region
+def _tables_client_region(cur, month, column_map, top_n):
+    """TABLE 2 (by client), 3 (by region) and 4B (client-by-region with revenue) for ONE month.
+    Returns {'2': text, '3': text, '4B': text} - only the ones that can be built."""
+    parts = {}
+    client, region = column_map.get('client'), column_map.get('region')
+
     for label, col in (('CLIENT', client), ('REGION', region)):
         if not col or col not in cur.columns:
             continue
@@ -362,9 +506,141 @@ def build_data_tables(df_cir_raw, df_res_raw, selected_month, column_map, top_n=
         if t.empty:
             continue
         t = t.sort_values('Revenue_USDm' if 'Revenue_USDm' in t.columns else t.columns[1], ascending=False)
-        scope = f"top {top_n} of {len(t)}" if len(t) > top_n else f"all {len(t)}"
+        limit = top_n if label == 'CLIENT' else max(top_n, 30)   # regions are few: effectively never cut
+        scope = f"top {limit} of {len(t)}" if len(t) > limit else f"all {len(t)}"
         n = 2 if label == 'CLIENT' else 3
-        parts.append(f"TABLE {n} - {selected_month} BY {label} ({scope}, sorted by revenue)\n" + _csv(t.head(top_n)))
+        parts[str(n)] = f"TABLE {n} - {month} BY {label} ({scope}, sorted by revenue)\n" + _csv(t.head(limit))
+
+    # 4B. Client-by-region WITH revenue/GP/GPM, so "revenue of the accounts in Europe" is a lookup, not maths
+    if client and region and client in cur.columns and region in cur.columns:
+        rc = _agg(cur, [region, client], column_map)
+        if not rc.empty and 'Revenue_USDm' in rc.columns:
+            cap = min(REGION_CLIENT_CAP, top_n * 2)
+            rc = rc.sort_values([region, 'Revenue_USDm'], ascending=[True, False])
+            shown = rc.groupby(region, sort=False).head(cap)
+            scope = (f"all {len(rc)} rows" if len(shown) == len(rc)
+                     else f"top {cap} clients per region - {len(shown)} of {len(rc)} rows shown, list is truncated")
+            parts['4B'] = (f"TABLE 4B - {month} CLIENT-BY-REGION: every client's revenue/GP/GPM inside its region ({scope}). "
+                           f"Use it to list a region's accounts and their revenue; region totals are in TABLE 3\n" + _csv(shown))
+        elif rc.empty:
+            m = cur[[client, region]].drop_duplicates().sort_values([region, client])
+            if not m.empty:
+                parts['4B'] = f"TABLE 4B - {month} CLIENT-TO-REGION MAPPING (no revenue column detected)\n" + _csv(m)
+    return parts
+
+
+def _tables_headcount_month(res_cur, month, column_map, top_n):
+    """TABLE 6 (active headcount by client) and 7 (by region, bench shown separately) for ONE month."""
+    parts = {}
+    if res_cur is None or len(res_cur) == 0:
+        return parts
+    emp = column_map.get('res_emp')
+    emp = emp if emp in res_cur.columns else None
+    active, bench = identify_bench_resources(res_cur, column_map)
+
+    def _grouped(frame, col):
+        if frame is None or len(frame) == 0 or col not in frame.columns:
+            return pd.Series(dtype='int64')
+        return frame.groupby(col)[emp].nunique() if emp else frame.groupby(col).size()
+
+    col = column_map.get('res_client')
+    if col and col in res_cur.columns:
+        g = _grouped(active, col)
+        if len(g):
+            g = g.rename('Headcount').reset_index().sort_values('Headcount', ascending=False)
+            scope = f"top {top_n} of {len(g)}" if len(g) > top_n else f"all {len(g)}"
+            parts['6'] = f"TABLE 6 - {month} ACTIVE HEADCOUNT BY CLIENT ({scope}; bench excluded)\n" + _csv(g.head(top_n))
+
+    col = column_map.get('res_region')
+    if col and col in res_cur.columns:
+        g = pd.DataFrame({'Active_Headcount': _grouped(active, col),
+                          'Bench_Headcount': _grouped(bench, col)}).fillna(0).astype(int)
+        if len(g):
+            g.index.name = col
+            g = g.reset_index().sort_values('Active_Headcount', ascending=False)
+            scope = f"top {top_n} of {len(g)}" if len(g) > top_n else f"all {len(g)}"
+            parts['7'] = (f"TABLE 7 - {month} HEADCOUNT BY REGION ({scope}; Active_Headcount excludes bench, "
+                          f"Bench_Headcount is separate)\n" + _csv(g.head(top_n)))
+    return parts
+
+
+def _mismatch_parts(mismatches, client_cap=15):
+    """TABLE M / M2: months whose numbers differ between files - BOTH values side by side."""
+    if not mismatches:
+        return []
+    mm_month, mm_client = mismatches
+    if mm_month is None or len(mm_month) == 0:
+        return []
+    cols = ['Month', 'Default_Source', 'Other_Source'] + [c for c in mm_month.columns
+                                                          if c.split('_')[0] in ('Revenue', 'Cost', 'GP')]
+    out = ["TABLE M - MONTHS WHOSE NUMBERS DIFFER BETWEEN FILES (USD m). Default_* = the file that reports that "
+           "month (used by default); Other_* = the same month as found in another file. Show BOTH when comparing; "
+           "never blend\n" + _csv(mm_month[cols])]
+    if mm_client is not None and len(mm_client):
+        out.append("TABLE M2 - CLIENTS BEHIND THE DIFFERENCES IN TABLE M (largest first)\n" + _csv(mm_client.head(client_cap)))
+    return out
+
+
+_MULTI_RE = re.compile(
+    r'\b(overall|ytd|year[- ]to[- ]date|all months|cumulative|trend|so far|compar\w*|vs\.?|versus|chang\w*|growth|'
+    r'previous month|last month|prior month|month[- ]over[- ]month|mom|each month|by month|monthly|across months|history|since)\b',
+    re.IGNORECASE)
+
+
+def wants_multi_month(question, extra_months=None):
+    """True when the question needs more than the selected month: it names another month, compares, or asks overall/YTD."""
+    return bool(extra_months) or bool(_MULTI_RE.search(question or ''))
+
+
+def describe_sources(df):
+    """'Jan-Jul: fileA / Aug: fileB' - which file is the default for each month (runs of consecutive months)."""
+    if df is None or df.empty or SOURCE_COL not in df.columns or 'Month' not in df.columns:
+        return ""
+    by_month = df.groupby('Month')[SOURCE_COL].first()
+    runs = []
+    for m in get_available_months(df):
+        f = by_month.get(m)
+        if runs and runs[-1][1] == f:
+            runs[-1][2] = m
+        else:
+            runs.append([m, f, m])
+    return "\n".join(f"- {a if a == b else a + '-' + b}: {f}" for a, f, b in runs)
+
+
+def build_data_tables(df_cir_raw, df_res_raw, selected_month, column_map, top_n=TOP_N, extra_months=None,
+                      mismatches=None, multi_month=False):
+    """All figures the model is allowed to quote, computed with pandas.
+    extra_months: other loaded months named in the user's question - they get their own
+    client / region / client-by-region / headcount tables so 'region revenue in July' is answerable."""
+    parts = []
+    months = get_available_months(df_cir_raw)
+    cur = df_cir_raw[df_cir_raw['Month'] == selected_month]
+    client, rev = column_map.get('client'), column_map.get('revenue')
+
+    # 1. Totals by month
+    trend = _agg(df_cir_raw, 'Month', column_map)
+    if not trend.empty:
+        trend['Month'] = pd.Categorical(trend['Month'], categories=months, ordered=True)
+        trend = trend.sort_values('Month')
+        trend_out = trend.copy()
+        trend_out['Month'] = trend_out['Month'].astype(str)
+        note = ""
+        if len(months) > 1:
+            tot = {'Month': 'ALL_MONTHS'}
+            for c in ('Revenue_USDm', 'Cost_USDm', 'GP_USDm'):
+                if c in trend.columns:
+                    tot[c] = trend[c].sum()
+            if 'Revenue_USDm' in tot and 'GP_USDm' in tot:
+                tot['GPM_pct'] = tot['GP_USDm'] / tot['Revenue_USDm'] * 100 if tot['Revenue_USDm'] else np.nan
+            trend_out = pd.concat([trend_out, pd.DataFrame([tot])], ignore_index=True)
+            note = "; last row ALL_MONTHS = all loaded months combined"
+        parts.append(f"TABLE 1 - TOTALS BY MONTH (each month from its own default file{note}; GPM_pct = GP / Revenue)\n"
+                     + _csv(trend_out))
+    parts += _mismatch_parts(mismatches)
+
+    # 2, 3 & 4B. Selected month by client / region / client-by-region
+    main = _tables_client_region(cur, selected_month, column_map, top_n)
+    parts += [main[k] for k in ('2', '3') if k in main]
 
     # 4. Revenue by client across months, with change vs previous month
     if client and rev and client in df_cir_raw.columns and len(months) > 1:
@@ -377,34 +653,59 @@ def build_data_tables(df_cir_raw, df_res_raw, selected_month, column_map, top_n=
                 delta = pv[selected_month] - pv[prev]
                 pv[f'Chg_{selected_month}_vs_{prev}_USDm'] = delta
                 pv['Chg_pct'] = np.where(pv[prev].fillna(0) != 0, delta / pv[prev] * 100, np.nan)
+            pv['Total_all_months'] = pv[[m for m in months if m in pv.columns]].sum(axis=1)
             pv = pv.sort_values(selected_month, ascending=False).head(top_n).reset_index()
-            parts.append(f"TABLE 4 - REVENUE USD m BY CLIENT ACROSS MONTHS (top {top_n} by {selected_month})\n" + _csv(pv))
+            parts.append(f"TABLE 4 - REVENUE USD m BY CLIENT ACROSS MONTHS (top {top_n} by {selected_month}; "
+                         f"each month from its own default file)\n" + _csv(pv))
 
-    # 4b. CLIENT-TO-REGION MAPPING (NEW) - Essential for answering "which clients are in [region]?"
-    if client and region and client in cur.columns and region in cur.columns:
-        client_region_map = cur[[client, region]].drop_duplicates().sort_values(client)
-        if not client_region_map.empty:
-            parts.append(f"TABLE 4B - CLIENT-TO-REGION MAPPING ({selected_month}; use to answer 'which clients are in X region')\n" + _csv(client_region_map))
+    if '4B' in main:
+        parts.append(main['4B'])
 
-    # 5-7. Headcount
-    if df_res_raw is not None and len(df_res_raw) > 0 and 'Month' in df_res_raw.columns:
+    # 5-7. Headcount (active and bench are ALWAYS reported separately, matching the snapshot figure)
+    has_res = df_res_raw is not None and len(df_res_raw) > 0 and 'Month' in df_res_raw.columns
+    if has_res:
         emp = column_map.get('res_emp')
         emp = emp if emp in df_res_raw.columns else None
 
         rows = []
         for m in get_available_months(df_res_raw):
-            sub = df_res_raw[df_res_raw['Month'] == m]
-            rows.append((m, int(sub[emp].nunique()) if emp else len(sub)))
-        parts.append("TABLE 5 - HEADCOUNT BY MONTH\n" + _csv(pd.DataFrame(rows, columns=['Month', 'Headcount'])))
+            active, bench = identify_bench_resources(df_res_raw[df_res_raw['Month'] == m], column_map)
+            rows.append((m, _hc(active, emp), _hc(bench, emp)))
+        parts.append("TABLE 5 - HEADCOUNT BY MONTH (Active_Headcount excludes bench; Bench_Headcount is separate)\n" +
+                     _csv(pd.DataFrame(rows, columns=['Month', 'Active_Headcount', 'Bench_Headcount'])))
 
-        res_cur = df_res_raw[df_res_raw['Month'] == selected_month]
-        for n, (label, key) in enumerate((('CLIENT', 'res_client'), ('REGION', 'res_region')), start=6):
-            col = column_map.get(key)
-            if col and col in res_cur.columns and len(res_cur):
-                g = res_cur.groupby(col)[emp].nunique() if emp else res_cur.groupby(col).size()
-                g = g.rename('Headcount').reset_index().sort_values('Headcount', ascending=False)
-                scope = f"top {top_n} of {len(g)}" if len(g) > top_n else f"all {len(g)}"
-                parts.append(f"TABLE {n} - {selected_month} HEADCOUNT BY {label} ({scope})\n" + _csv(g.head(top_n)))
+        hc = _tables_headcount_month(df_res_raw[df_res_raw['Month'] == selected_month],
+                                     selected_month, column_map, top_n)
+        parts += [hc[k] for k in ('6', '7') if k in hc]
+
+    # Overall / YTD / comparison questions: every loaded month, each from its own default file
+    if multi_month and len(months) > 1:
+        region = column_map.get('region')
+        if region and rev and region in df_cir_raw.columns:
+            pr = df_cir_raw.pivot_table(index=region, columns='Month', values=rev, aggfunc='sum')
+            pr = pr.reindex(columns=[m for m in months if m in pr.columns])
+            pr['Total_all_months'] = pr.sum(axis=1)
+            pr = pr.sort_values('Total_all_months', ascending=False).reset_index()
+            parts.append("TABLE 8 - REVENUE USD m BY REGION ACROSS MONTHS (each month from its own default file)\n" + _csv(pr))
+        if client and client in df_cir_raw.columns:
+            t = _agg(df_cir_raw, client, column_map)
+            if not t.empty:
+                t = t.sort_values('Revenue_USDm' if 'Revenue_USDm' in t.columns else t.columns[1], ascending=False)
+                scope = f"top {top_n} of {len(t)}" if len(t) > top_n else f"all {len(t)}"
+                parts.append(f"TABLE 9 - ALL LOADED MONTHS COMBINED ({months[0]}-{months[-1]}) BY CLIENT "
+                             f"({scope}, sorted by revenue)\n" + _csv(t.head(top_n)))
+
+    # Other months named in the question
+    for m in extra_months or []:
+        if m == selected_month or m not in months:
+            continue
+        block = [f"=== ADDITIONAL MONTH REQUESTED IN THE QUESTION: {m} (same layout as TABLES 2, 3, 4B, 6, 7 above) ==="]
+        ex = _tables_client_region(df_cir_raw[df_cir_raw['Month'] == m], m, column_map, top_n)
+        block += [ex[k] for k in ('2', '3', '4B') if k in ex]
+        if has_res:
+            exh = _tables_headcount_month(df_res_raw[df_res_raw['Month'] == m], m, column_map, top_n)
+            block += [exh[k] for k in ('6', '7') if k in exh]
+        parts.append("\n\n".join(block))
 
     return "\n\n".join(parts)
 
@@ -429,32 +730,40 @@ def build_chart_frames(cir_raw, selected_month, column_map, top_n=10):
     return frames
 
 
-def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month, column_map=None, data_tables=""):
+def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month, column_map=None,
+                             data_tables="", extra_months=None, source_note=""):
     """Context injected into the system prompt."""
     lines = ["=" * 60, "GGM PORTFOLIO ANALYSIS CONTEXT", "=" * 60, ""]
 
     if column_map:
         lines += ["DETECTED COLUMNS:", get_column_explanations(column_map), ""]
 
-    # Extract year from data if available, default to YEAR constant
-    year = YEAR  # Default from YEAR = "2026"
-    if df_cir_raw is not None and not df_cir_raw.empty and 'Year' in df_cir_raw.columns:
-        year_vals = df_cir_raw['Year'].dropna().unique()
-        if len(year_vals) > 0:
-            year = str(int(year_vals[0]))
-    
-    # Format snapshot with explicit year
+    # Year: prefer the loader's year column, then a 'Year' column from the file, else the YEAR constant
+    year = YEAR
+    if df_cir_raw is not None and not df_cir_raw.empty:
+        for ycol in (YEAR_COL, 'Year'):
+            if ycol in df_cir_raw.columns:
+                vals = df_cir_raw[ycol].dropna().unique()
+                if len(vals) > 0:
+                    try:
+                        year = str(int(vals[0]))
+                    except (TypeError, ValueError):
+                        year = str(vals[0])
+                    break
+
     snapshot_period = f"{selected_month} {year}"
-    
+    extra_months = [m for m in (extra_months or []) if m != selected_month]
+
     lines += [
         f"SNAPSHOT - {snapshot_period} (USD millions unless stated):",
         f"- Revenue: {metrics.get('revenue', 0):.3f}",
         f"- Gross Profit: {metrics.get('profit', 0):.3f}",
         f"- GPM: {metrics.get('gpm', 0):.2f}%",
-        f"- Headcount: {metrics.get('headcount', 0)}",
-        f"- Active accounts: {metrics.get('accounts', 0)}",
-        "",
+        f"- Headcount (active, bench excluded): {metrics.get('headcount', 0)}",
     ]
+    if metrics.get('headcount_bench', 0) > 0:
+        lines.append(f"- Bench headcount (separate from active): {metrics.get('headcount_bench', 0)}")
+    lines += [f"- Active accounts: {metrics.get('accounts', 0)}", ""]
 
     if df_cir_raw is not None and 'Month' in df_cir_raw.columns:
         months_loaded = get_available_months(df_cir_raw)
@@ -462,22 +771,26 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month
 
     lines += ["CRITICAL CONTEXT:"]
     lines += [f"- User has FILTERED to month: {selected_month}"]
-    lines += [f"- ALL answers MUST be for {selected_month} ONLY, UNLESS user explicitly asks for 'comparison' or 'vs previous/other month'"]
-    lines += [f"- If user asks 'what is revenue?', answer with {selected_month} revenue only"]
-    lines += [f"- If user asks 'compare August to July', THEN you may use Table 4 (across months)"]
-    lines += [f"- Default: Answer about {selected_month} unless otherwise asked"]
+    lines += [f"- Default: answer for {selected_month} ONLY (e.g. 'what is revenue?' = {selected_month} revenue)"]
+    lines += ["- If the user names a different month, or asks to compare / vs / change / previous month, use the tables for those months"]
+    if extra_months:
+        lines += [f"- This question names additional month(s): {', '.join(extra_months)} - their tables are included below"]
     lines += [""]
-    
+
+    if source_note:
+        lines += ["DATA SOURCES (default file for each month - single-month answers use ONLY these):", source_note, ""]
+
     lines += ["VP TERMINOLOGY:"]
     lines += [f"- {metric}: {', '.join(syns[:5])}" for metric, syns in SYNONYM_MAP.items()]
     lines += [""]
-    
-    # Add explicit context about Europe clients (helps answer "which clients in Europe?")
+
+    # Explicit context about Europe clients (helps answer "which clients in Europe?")
     if df_cir is not None and not df_cir.empty and column_map and column_map.get('client') and column_map.get('region'):
         client_col = column_map.get('client')
         region_col = column_map.get('region')
         if client_col in df_cir.columns and region_col in df_cir.columns:
-            europe_clients = df_cir[df_cir[region_col].astype(str).str.lower() == 'europe'][client_col].unique()
+            is_europe = df_cir[region_col].astype(str).str.strip().str.lower() == 'europe'
+            europe_clients = df_cir.loc[is_europe, client_col].dropna().astype(str).unique()
             if len(europe_clients) > 0:
                 lines += [f"EUROPE REGION CLIENTS (for {selected_month}): {', '.join(sorted(europe_clients))}"]
                 lines += [""]
@@ -488,13 +801,96 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month
     return "\n".join(lines)
 
 
+def estimate_tokens(text):
+    """Rough token estimate (no tokenizer dependency). Deliberately conservative for CSV-heavy text."""
+    return int(len(text) / CHARS_PER_TOKEN) + 1
+
+
+def build_system_prompt(dynamic_context, hint_line=""):
+    return f"""You are a senior portfolio analyst at GGM Data & Insights, answering questions from VPs.
+
+{dynamic_context}
+
+RULES
+1. Answer ONLY from the snapshot and DATA TABLES above. Quote figures exactly as shown (USD millions; GPM as %).
+2. MONTH FILTER RULE (CRITICAL): The user has selected a month. Answer for that month ONLY, UNLESS the question names another month or asks for "comparison", "vs", "change", or "previous month". Examples:
+   - Q: "What is our revenue?" -> A: Revenue for the selected month only
+   - Q: "Compare August to July" -> A: Use Table 4 to show both months
+   - Q: "Revenue by region in July" -> A: Use the tables under "ADDITIONAL MONTH REQUESTED" for July
+   Default: single-month analysis.
+3. Do NOT calculate totals, averages, growth rates or rankings yourself. Use the pre-computed columns (e.g. Chg_pct) and the order the tables are sorted in. Region totals are in TABLE 3; a region's accounts with revenue/GP/GPM are in TABLE 4B. If a figure you need is not in the tables, say it is not available and name the data that would be needed.
+4. Do NOT assume, guess, or estimate any numbers. All figures must come directly from the tables. If you cannot find a number in the data, say "not available in the current data" rather than approximating or deriving unstated values.
+5. Translate VP wording to metrics (sales -> revenue, GP -> profit, margin -> GPM, team -> headcount, client/customer -> account).
+6. For questions about accounts/clients in a region (e.g. "account-level revenue in Europe"), read that region's rows from TABLE 4B (client, Revenue_USDm, GP_USDm, GPM_pct) and quote the region total from TABLE 3. If TABLE 4B says its list is truncated, say so.
+7. Tables marked "top N of M" are truncated - make no claims about accounts that are not shown.
+8. Headcount: "Active" excludes bench; bench is reported separately. Never add or mix them unless asked. Client names in the headcount data may be spelled differently from the financial data - flag a mismatch rather than guess.
+9. Be concise and executive-ready: lead with the answer, add 2-4 supporting points, finish with one suggested follow-up.
+10. SOURCES (CRITICAL): each month's default figures come from the file that reports that month (see DATA SOURCES) - e.g. August from the August file. A single-month question uses ONLY that month's default figures. Comparison / overall / YTD questions combine months using their own default figures (TABLES 1, 4, 8, 9). If a month is listed in TABLE M, its numbers differ between files: when comparing, state BOTH values separately, labelled by file (Default vs Other), say which one is the default, and never average or blend them. If a single-month question is about a month listed in TABLE M, add one short note.
+11. NAMES AND REGIONS: use client and region names exactly as written in the tables. Never add, rename, merge, group or infer clients, and never fill gaps from general knowledge. For a region, list only that region's rows from TABLE 4B. Say "top N" only when a table title says so; otherwise say how many rows the table has.{hint_line}"""
+
+
+def assemble_prompt(df_cir, df_res, metrics, cir_raw, res_raw, selected_month, column_map,
+                    extra_months, history, hint_line, token_budget, extras=None):
+    """
+    Build the system prompt and keep the whole request inside the token budget.
+    Order of trimming: shrink every table (TOP_N -> 15 -> 10 -> 7 -> 5 rows), then drop the
+    oldest chat turns. The current question is never dropped.
+    Returns a dict: system_prompt, tables, top_n, est_tokens, history, trimmed_rows,
+    trimmed_history, over_budget, input_budget.
+    """
+    extras = extras or {}
+    input_budget = max(int(token_budget) - MAX_OUTPUT_TOKENS, 1500)
+    steps = [TOP_N] + [n for n in (15, 10, 7, 5) if n < TOP_N]
+    history = list(history)
+
+    def _hist_tokens(h):
+        return sum(estimate_tokens(m['content']) for m in h)
+
+    n = steps[0]
+    tables = system_prompt = ""
+    base = 0
+    for n in steps:
+        tables = build_data_tables(cir_raw, res_raw, selected_month, column_map, top_n=n, extra_months=extra_months,
+                                   mismatches=extras.get('mismatches'), multi_month=extras.get('multi_month', False))
+        ctx = generate_dynamic_context(df_cir, df_res, metrics, cir_raw, selected_month, column_map, tables, extra_months,
+                                       source_note=extras.get('source_note', ''))
+        system_prompt = build_system_prompt(ctx, hint_line)
+        base = estimate_tokens(system_prompt)
+        if base + _hist_tokens(history) <= input_budget:
+            break
+
+    dropped = 0
+    while len(history) > 1 and base + _hist_tokens(history) > input_budget:
+        history = history[1:]
+        dropped += 1
+
+    total = base + _hist_tokens(history)
+    return {
+        "system_prompt": system_prompt, "tables": tables, "top_n": n, "est_tokens": total,
+        "history": history, "trimmed_rows": n < steps[0], "trimmed_history": dropped,
+        "over_budget": total > input_budget, "input_budget": input_budget,
+    }
+
+
+_LIMIT_HINTS = ('413', 'request too large', 'tokens per minute', 'rate_limit', 'rate limit',
+                'too many tokens', 'context length', 'context_length', 'reduce the length')
+
+
+def _friendly_groq_error(e):
+    """Turn token-limit / rate-limit failures into a clear message; other errors pass through unchanged."""
+    msg = str(e)
+    if any(h in msg.lower() for h in _LIMIT_HINTS):
+        return "token/rate limit exceeded for this model"
+    return msg
+
+
 def get_groq_response(client, messages, models):
     """Try each model in turn. Returns (text, model_used, errors) - text is None if all failed."""
     errors = []
     for model in models:
         try:
             response = client.chat.completions.create(
-                model=model, messages=messages, max_tokens=1024, temperature=0.2
+                model=model, messages=messages, max_tokens=MAX_OUTPUT_TOKENS, temperature=0.2
             )
             text = response.choices[0].message.content
             if text and text.strip():
@@ -503,7 +899,9 @@ def get_groq_response(client, messages, models):
         except Exception as e:
             # Groq's "Connection error." hides the real reason (proxy, SSL, DNS) in __cause__
             cause = f" | cause: {type(e.__cause__).__name__}: {e.__cause__}" if e.__cause__ else ""
-            errors.append(f"{model}: {e}{cause}")
+            friendly = _friendly_groq_error(e)
+            detail = f" | details: {str(e)[:300]}" if friendly != str(e) else ""
+            errors.append(f"{model}: {friendly}{detail}{cause}")
     return None, None, errors
 
 
@@ -539,8 +937,10 @@ def translate_vp_language(query):
 
 
 def _read_uploads(files, kind, log):
-    """Read uploaded Excel files into one frame; month comes from the file name."""
-    by_month = {}
+    """Read uploaded Excel files into one frame. Month AND year come from the file name
+    (year falls back to YEAR). The Circle filter is applied exactly like the folder loader does."""
+    by_period = {}
+    default_year = int(YEAR) if str(YEAR).isdigit() else None
     for f in files or []:
         # Read by sheet name "Sheet1" (source of truth), with fallback to index 0
         try:
@@ -550,12 +950,24 @@ def _read_uploads(files, kind, log):
             df = pd.read_excel(f, sheet_name=0, header=0)
         df.columns = [str(c).strip() for c in df.columns]
         month = infer_month_from_text(f.name) or 'Uploaded'
-        if month in by_month:
-            log.append(f"{kind}: more than one file for '{month}' - '{f.name}' replaced the earlier one. "
+        year = infer_year_from_text(f.name, default=default_year)
+        # Month per row comes from the file's own Month column (a monthly file also holds earlier months);
+        # the file-name month is only the file's report month / fallback.
+        assign_months(df, month, f"{kind} '{f.name}'", log)
+        month = df['Report_Month'].iloc[0] if len(df) else month
+        if (year, month) in by_period:
+            log.append(f"{kind}: more than one file reporting '{month} {year}' - '{f.name}' replaced the earlier one. "
                        f"Put the month in the file name (e.g. '... Aug 2026.xlsx') to load several months.")
-        df['Month'] = month
-        by_month[month] = df
-    return pd.concat(by_month.values(), ignore_index=True) if by_month else pd.DataFrame()
+        df[SOURCE_COL] = f.name
+        df[YEAR_COL] = year
+
+        if 'Circle' in df.columns:
+            df = apply_circle_filter(df, 'Circle', CIRCLE_NAME, f"{kind} '{f.name}'", log)
+            if len(df) == 0:
+                log.append(f"⚠️ {kind}: '{f.name}' had no rows matching Circle='{CIRCLE_NAME}' - file skipped")
+                continue
+        by_period[(year, month)] = df
+    return pd.concat(by_period.values(), ignore_index=True) if by_period else pd.DataFrame()
 
 
 # ============================================================================
@@ -573,6 +985,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("📂 Data Source")
 
 base_path = get_secret("paths", "base_path") or os.environ.get("GGM_BASE_PATH") or DEFAULT_BASE_PATH
+years_cfg = get_secret("paths", "years") or os.environ.get("GGM_YEARS") or YEARS
 local_ok = os.path.isdir(base_path)
 
 source = st.sidebar.radio("Choose source:", ["Local Folder (Auto-Load)", "Manual Upload"],
@@ -589,7 +1002,7 @@ if source.startswith("Local"):
             with st.spinner("Scanning folders and loading data..."):
                 try:
                     cir, res = load_monthly_data_from_folder(
-                        base_path, YEAR, circle_name='', 
+                        base_path, years_cfg, circle_name='', 
                         circle_column='Circle', circle_value=CIRCLE_NAME, 
                         log=load_log
                     )
@@ -613,17 +1026,13 @@ else:
     elif sig != st.session_state.upload_sig:
         up_log = []
         try:
+            # Circle filter is applied per file inside _read_uploads - same rule as the folder loader
             cir_uploaded = _read_uploads(circle_files, "Circle Wise", up_log)
-            # Filter uploaded data to circle if 'Circle' column exists
-            if 'Circle' in cir_uploaded.columns:
-                before = len(cir_uploaded)
-                cir_uploaded = cir_uploaded[cir_uploaded['Circle'].astype(str).str.strip() == CIRCLE_NAME].copy()
-                up_log.append(f"Circle filter: {before} → {len(cir_uploaded)} rows")
-            st.session_state.upload_data = {
-                "cir": cir_uploaded,
-                "res": _read_uploads(resource_files, "Resource", up_log),
-                "log": up_log,
-            }
+            res_uploaded = _read_uploads(resource_files, "Resource", up_log)
+            if resource_files and res_uploaded.empty:
+                st.sidebar.warning("Resource file(s) loaded no rows - check the Circle value / file names "
+                                   "(see Data Quality Log).")
+            st.session_state.upload_data = {"cir": cir_uploaded, "res": res_uploaded, "log": up_log}
             st.session_state.upload_sig = sig
         except Exception as e:
             st.session_state.upload_data = None
@@ -641,19 +1050,55 @@ if data is None or data["cir"] is None or data["cir"].empty:
     st.stop()
 
 # ---- Prepare data (runs every rerun, cheap) ----
-cir_raw, circle_filtered = filter_circle(data["cir"])
-res_raw = data["res"] if data["res"] is not None else pd.DataFrame()
+cir_all = data["cir"]
+res_all = data["res"] if data["res"] is not None else pd.DataFrame()
+
+# Year: the loader tags every row; with several years loaded, one year is analysed at a time
+# so the same month in different years can never be summed together.
+selected_year = None
+if YEAR_COL in cir_all.columns:
+    years = sorted(cir_all[YEAR_COL].dropna().unique().tolist(), key=str)
+    if years:
+        if len(years) > 1:
+            selected_year = st.sidebar.selectbox("Select year:", options=years, index=len(years) - 1,
+                                                 key="year_" + "_".join(map(str, years)))
+        else:
+            selected_year = years[0]
+        cir_all = cir_all[cir_all[YEAR_COL] == selected_year].copy()
+        if YEAR_COL in res_all.columns:
+            res_all = res_all[res_all[YEAR_COL] == selected_year].copy()
+
+cir_raw, circle_filtered = filter_circle(cir_all)
+res_raw = res_all
 column_map = detect_column_mapping(cir_raw, res_raw)
 cir_raw, dropped_rows = clean_circle_df(cir_raw, column_map)
+
+# Clean client/region labels BEFORE overrides and every groupby (trim, collapse spaces, merge case variants)
+cir_raw, norm_cir = normalize_labels(cir_raw, [column_map.get('client'), column_map.get('region')])
+res_raw, norm_res = normalize_labels(res_raw, [column_map.get('res_client'), column_map.get('res_region')])
 
 # Apply region overrides to raw data for both Circle Wise and Resource (affects all aggregations)
 cir_raw = apply_region_overrides(cir_raw, column_map, data_type='cir')
 res_raw = apply_region_overrides(res_raw, column_map, data_type='res')
 
+# A monthly file also holds earlier months, so a month can appear in several files. Default = the file that
+# REPORTS the month (August -> the August file). Same month in other files is kept aside ONLY to show differences.
+cir_raw, cir_other = select_authoritative(cir_raw)
+res_raw, _res_other = select_authoritative(res_raw)
+mm_month, mm_client = month_mismatches(cir_raw, cir_other, column_map.get('revenue'), column_map.get('cost'),
+                                       column_map.get('profit'), column_map.get('client'))
+source_note = describe_sources(cir_raw)
+
 months = get_available_months(cir_raw)
 selected_month = st.sidebar.selectbox("Select month for dashboard:", options=months,
-                                      index=len(months) - 1, key="month_" + "_".join(months))
-st.sidebar.success(f"✅ Data loaded - months: {', '.join(months)}")
+                                      index=len(months) - 1, key=f"month_{selected_year}_" + "_".join(months))
+st.sidebar.success(f"✅ Data loaded - {f'{selected_year} ' if selected_year is not None else ''}months: {', '.join(months)}")
+
+if mm_month is not None and not mm_month.empty:
+    _pairs = sorted({f"{r.Month} ({r.Default_Source} vs {r.Other_Source})" for r in mm_month.itertuples()})
+    st.warning("⚠️ **Numbers differ between files for:** " + ", ".join(_pairs) +
+               ". The default is the file that reports the month; both sets of numbers are shown under "
+               "'Detected columns & data checks'.")
 
 # CRITICAL DATA VALIDATION - Show exactly what data is being used (AFTER month selector)
 with st.expander("🔍 DATA VALIDATION - Exact Figures for Selected Month"):
@@ -664,6 +1109,8 @@ with st.expander("🔍 DATA VALIDATION - Exact Figures for Selected Month"):
     if 'Month' in cir_raw.columns:
         selected_data = cir_raw[cir_raw['Month'].astype(str).str.strip() == selected_month]
         debug_lines.append(f"✓ Rows in {selected_month}: {len(selected_data)} (from {len(cir_raw)} total)")
+        if SOURCE_COL in selected_data.columns:
+            debug_lines.append(f"✓ {selected_month} figures come from: {', '.join(sorted(selected_data[SOURCE_COL].astype(str).unique()))}")
         
         rev_col = column_map.get('revenue')
         region_col = column_map.get('region')
@@ -694,6 +1141,10 @@ groq_api_key = get_secret("groq", "api_key") or os.environ.get("GROQ_API_KEY")
 if not groq_api_key:
     st.warning("⚠️ **Groq API key not configured** - add it to .streamlit/secrets.toml (local) or the Streamlit Cloud Secrets settings.")
 models = list(get_secret("groq", "models") or DEFAULT_MODELS)
+try:
+    token_budget = int(get_secret("groq", "token_budget") or os.environ.get("GROQ_TOKEN_BUDGET") or MODEL_TOKEN_BUDGET)
+except (TypeError, ValueError):
+    token_budget = MODEL_TOKEN_BUDGET
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Revenue", f"${metrics['revenue']:.3f}M")
@@ -751,6 +1202,26 @@ with st.expander("📋 Detected columns & data checks"):
     st.dataframe(chk.reindex(months))
     st.caption(f"Circle filter ('{CIRCLE_NAME}') applied: {'yes' if circle_filtered else 'NO - no matching Circle column/value, all rows used'}")
     st.caption(f"'Total' summary rows removed: {dropped_rows}")
+    cleanup = {**{f"revenue file / {k}": v for k, v in norm_cir.items()},
+               **{f"resource file / {k}": v for k, v in norm_res.items()}}
+    if cleanup:
+        st.caption("Label cleanup merged spelling/spacing variants - " +
+                   ", ".join(f"{k}: {v}" for k, v in cleanup.items()))
+    if selected_year is not None:
+        st.caption(f"Year analysed: {selected_year}")
+    if source_note:
+        st.caption("Default source file per month:")
+        for line in source_note.split("\n"):
+            st.caption(line)
+    st.subheader("Months that differ between files")
+    if mm_month is not None and not mm_month.empty:
+        st.caption("Default_* = file that reports the month (used by default). Other_* = same month in another file. USD m.")
+        st.dataframe(mm_month.round(3))
+        if mm_client is not None and not mm_client.empty:
+            st.caption("Clients behind the differences (revenue):")
+            st.dataframe(mm_client.round(3))
+    else:
+        st.caption("No differences found between files for the same month.")
     
     # Client matching validation
     validation_log = []
@@ -785,7 +1256,8 @@ prompt = st.session_state.pending_prompt or typed
 st.session_state.pending_prompt = None
 
 if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    # The turn is saved to chat history ONLY after the model answers, so a failed call
+    # never leaves a dangling user message that would be re-sent with the next question.
     with st.chat_message("user"):
         st.markdown(prompt)
 
@@ -798,58 +1270,62 @@ if prompt:
                     from groq import Groq
                     client = Groq(api_key=groq_api_key)
 
-                    data_tables = build_data_tables(cir_raw, res_raw, selected_month, column_map)
-                    dynamic_context = generate_dynamic_context(
-                        df_cir, df_res, metrics, cir_raw, selected_month, column_map, data_tables
-                    )
-                    
-                    # Show what data is being sent to model
-                    with st.expander("📊 Data Tables Sent to Model"):
-                        st.code(data_tables, language="text")
+                    # Other loaded months named in the question (e.g. "region revenue in July") get their own tables
+                    extra_months = [m for m in find_months_in_text(prompt, months) if m != selected_month]
                     hint = translate_vp_language(prompt)
                     hint_line = f"\nMetric terms detected in this question: {', '.join(hint)}." if hint else ""
 
-                    system_prompt = f"""You are a senior portfolio analyst at GGM Data & Insights, answering questions from VPs.
+                    prior = st.session_state.messages[-(HISTORY_TURNS - 1):] if HISTORY_TURNS > 1 else []
+                    history = [{"role": m["role"], "content": m["content"]} for m in prior]
+                    history.append({"role": "user", "content": prompt})
 
-{dynamic_context}
+                    extras = {
+                        "mismatches": (mm_month, mm_client),
+                        "multi_month": wants_multi_month(prompt, extra_months),
+                        "source_note": source_note,
+                    }
+                    pr = assemble_prompt(df_cir, df_res, metrics, cir_raw, res_raw, selected_month, column_map,
+                                         extra_months, history, hint_line, token_budget, extras)
+                    messages = [{"role": "system", "content": pr["system_prompt"]}] + pr["history"]
 
-RULES
-1. Answer ONLY from the snapshot and DATA TABLES above. Quote figures exactly as shown (USD millions; GPM as %).
-2. MONTH FILTER RULE (CRITICAL): User has selected a specific month for analysis. Answer ALL questions for that selected month ONLY, UNLESS the user explicitly asks for "comparison", "vs", "change", or "previous month". Examples:
-   - Q: "What is our revenue?" → A: Revenue for selected month only
-   - Q: "Compare August to July" → A: Use Table 4 to show both months
-   - Q: "What changed from last month?" → A: Use Table 4 for month-over-month
-   Default: Single month analysis.
-3. Do NOT calculate totals, averages, growth rates or rankings yourself. Use the pre-computed columns (e.g. Chg_pct) and the order the tables are sorted in. If a figure you need is not in the tables, say it is not available and name the data that would be needed.
-4. Do NOT assume, guess, or estimate any numbers. All figures must come directly from the tables. If you cannot find a number in the data, say "not available in the current data" rather than approximating or deriving unstated values.
-5. Translate VP wording to metrics (sales -> revenue, GP -> profit, margin -> GPM, team -> headcount, client/customer -> account).
-6. For questions about "clients in [region]" (e.g., "which clients are in Europe?"), use TABLE 4B (CLIENT-TO-REGION MAPPING) to identify relevant clients, then look up their revenue in TABLE 2 (BY CLIENT) or TABLE 4 (ACROSS MONTHS).
-7. Tables marked "top N of M" are truncated - make no claims about accounts that are not shown.
-8. Client names in the headcount data may be spelled differently from the financial data - flag a mismatch rather than guess.
-9. Be concise and executive-ready: lead with the answer, add 2-4 supporting points, finish with one suggested follow-up.{hint_line}"""
-
-                    history = [{"role": m["role"], "content": m["content"]}
-                               for m in st.session_state.messages[-HISTORY_TURNS:]]
-                    messages = [{"role": "system", "content": system_prompt}] + history
+                    # Show what data is being sent to model
+                    with st.expander("📊 Data Tables Sent to Model"):
+                        st.code(pr["tables"], language="text")
+                    if pr["trimmed_rows"] or pr["trimmed_history"]:
+                        st.caption(f"ℹ️ Context trimmed to fit the model's token budget: tables cut to top {pr['top_n']} rows"
+                                   + (f", {pr['trimmed_history']} older chat message(s) left out" if pr["trimmed_history"] else "")
+                                   + ". Ask about a specific account/region if it isn't shown.")
+                    if pr["over_budget"]:
+                        st.warning(f"⚠️ This request (~{pr['est_tokens']} tokens) is still above the configured input budget "
+                                   f"(~{pr['input_budget']}). The model may reject it - raise [groq] token_budget in secrets "
+                                   f"if your plan allows more, or ask a narrower question.")
 
                     answer, used_model, errors = get_groq_response(client, messages, models)
 
                     if answer:
+                        st.session_state.messages.append({"role": "user", "content": prompt})
                         st.session_state.messages.append({"role": "assistant", "content": answer})
                         st.markdown(answer)
-                        st.caption(f"Model: {used_model} · Figures computed from {selected_month} data and loaded months")
+                        months_note = f" + {', '.join(extra_months)}" if extra_months else ""
+                        src_files = (sorted(df_cir[SOURCE_COL].astype(str).unique())
+                                     if SOURCE_COL in df_cir.columns else [])
+                        src_txt = f" · {selected_month} source: {', '.join(src_files)}" if src_files else ""
+                        st.caption(f"Model: {used_model} · Figures computed from {selected_month}{months_note} data and loaded months{src_txt}")
                         if errors:
                             with st.expander("Fallback details"):
                                 for e in errors:
                                     st.caption(e)
                     else:
-                        st.error("❌ No response from any configured model.")
+                        st.error("❌ No response from any configured model. Your question was not saved - please resend it.")
+                        if any("token/rate limit" in e for e in errors):
+                            st.info("The request hit a model token/rate limit. Wait a minute and retry, ask a narrower "
+                                    "question, or lower the amount of data (see [groq] token_budget).")
                         with st.expander("Details"):
                             for e in errors:
                                 st.caption(e)
 
                 except Exception as e:
-                    st.error(f"❌ Error: {e}")
+                    st.error(f"❌ Error: {e}  (your question was not saved - please resend it)")
                     with st.expander("Technical details"):
                         st.code(traceback.format_exc())
 
