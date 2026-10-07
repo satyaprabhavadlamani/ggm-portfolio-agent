@@ -236,26 +236,39 @@ def validate_client_matching(df_cir, df_res, column_map, log=None, fuzzy_thresho
     return matched, revenue_unmatched, resource_unmatched
 
 
-def apply_region_overrides(df_cir, column_map):
+def apply_region_overrides(df, column_map, data_type='cir'):
     """
     Apply hardcoded region mappings for specific clients.
     - Digiterre → Europe
     - SFI → Europe
     Ignores the source region/country and always uses the override.
-    """
-    if df_cir is None or df_cir.empty:
-        return df_cir
     
-    client_col = column_map.get('client')
-    region_col = column_map.get('region')
+    Args:
+        df: DataFrame (Circle Wise or Resource)
+        column_map: Column name mapping
+        data_type: 'cir' for Circle Wise, 'res' for Resource data
+    
+    Returns:
+        DataFrame with region overrides applied
+    """
+    if df is None or df.empty:
+        return df
+    
+    # Determine which columns to use based on data type
+    if data_type == 'cir':
+        client_col = column_map.get('client')
+        region_col = column_map.get('region')
+    else:  # data_type == 'res'
+        client_col = column_map.get('res_client')
+        region_col = column_map.get('res_region')
     
     if not client_col or not region_col:
-        return df_cir
+        return df
     
-    if client_col not in df_cir.columns or region_col not in df_cir.columns:
-        return df_cir
+    if client_col not in df.columns or region_col not in df.columns:
+        return df
     
-    df_cir = df_cir.copy()
+    df = df.copy()
     
     # Apply region overrides for specific clients
     overrides = {
@@ -264,11 +277,11 @@ def apply_region_overrides(df_cir, column_map):
     }
     
     for client_name, target_region in overrides.items():
-        mask = df_cir[client_col].astype(str).str.strip() == client_name
+        mask = df[client_col].astype(str).str.strip() == client_name
         if mask.any():
-            df_cir.loc[mask, region_col] = target_region
+            df.loc[mask, region_col] = target_region
     
-    return df_cir
+    return df
 
 
 def get_available_metrics(df_cir, df_res, column_map):
@@ -591,13 +604,16 @@ res_raw = data["res"] if data["res"] is not None else pd.DataFrame()
 column_map = detect_column_mapping(cir_raw, res_raw)
 cir_raw, dropped_rows = clean_circle_df(cir_raw, column_map)
 
+# Apply region overrides to raw data for both Circle Wise and Resource (affects all aggregations)
+cir_raw = apply_region_overrides(cir_raw, column_map, data_type='cir')
+res_raw = apply_region_overrides(res_raw, column_map, data_type='res')
+
 months = get_available_months(cir_raw)
 selected_month = st.sidebar.selectbox("Select month for dashboard:", options=months,
                                       index=len(months) - 1, key="month_" + "_".join(months))
 st.sidebar.success(f"✅ Data loaded - months: {', '.join(months)}")
 
 df_cir = cir_raw[cir_raw["Month"] == selected_month].copy()
-df_cir = apply_region_overrides(df_cir, column_map)  # Apply Digiterre/SFI region mapping
 df_res = res_raw[res_raw["Month"] == selected_month].copy() if "Month" in res_raw.columns else res_raw
 
 if not column_map.get("revenue"):
