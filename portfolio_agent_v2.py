@@ -423,8 +423,18 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month
     if column_map:
         lines += ["DETECTED COLUMNS:", get_column_explanations(column_map), ""]
 
+    # Extract year from data if available, default to YEAR constant
+    year = YEAR  # Default from YEAR = "2026"
+    if df_cir_raw is not None and not df_cir_raw.empty and 'Year' in df_cir_raw.columns:
+        year_vals = df_cir_raw['Year'].dropna().unique()
+        if len(year_vals) > 0:
+            year = str(int(year_vals[0]))
+    
+    # Format snapshot with explicit year
+    snapshot_period = f"{selected_month} {year}"
+    
     lines += [
-        f"SNAPSHOT - {selected_month} (USD millions unless stated):",
+        f"SNAPSHOT - {snapshot_period} (USD millions unless stated):",
         f"- Revenue: {metrics.get('revenue', 0):.3f}",
         f"- Gross Profit: {metrics.get('profit', 0):.3f}",
         f"- GPM: {metrics.get('gpm', 0):.2f}%",
@@ -434,7 +444,8 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month
     ]
 
     if df_cir_raw is not None and 'Month' in df_cir_raw.columns:
-        lines += [f"MONTHS LOADED: {', '.join(get_available_months(df_cir_raw))}", ""]
+        months_loaded = get_available_months(df_cir_raw)
+        lines += [f"MONTHS LOADED: {', '.join(months_loaded)} ({year})", ""]
 
     lines += ["VP TERMINOLOGY:"]
     lines += [f"- {metric}: {', '.join(syns[:5])}" for metric, syns in SYNONYM_MAP.items()]
@@ -608,6 +619,29 @@ cir_raw, dropped_rows = clean_circle_df(cir_raw, column_map)
 cir_raw = apply_region_overrides(cir_raw, column_map, data_type='cir')
 res_raw = apply_region_overrides(res_raw, column_map, data_type='res')
 
+# Debug: Show status of region overrides
+with st.expander("🔍 DEBUG: Data Preparation Status"):
+    debug_lines = []
+    debug_lines.append(f"✓ Column mapping detected: client='{column_map.get('client')}', region='{column_map.get('region')}'")
+    debug_lines.append(f"✓ Data rows: Circle={len(cir_raw)}, Resource={len(res_raw)}")
+    
+    if 'Month' in cir_raw.columns and column_map.get('client') and column_map.get('region'):
+        client_col = column_map.get('client')
+        region_col = column_map.get('region')
+        
+        digiterre_rows = cir_raw[cir_raw[client_col].astype(str).str.strip() == 'Digiterre']
+        sfi_rows = cir_raw[cir_raw[client_col].astype(str).str.strip() == 'SFI']
+        europe_rows = cir_raw[cir_raw[region_col].astype(str).str.strip() == 'Europe']
+        
+        debug_lines.append(f"✓ Digiterre rows: {len(digiterre_rows)} → Region={digiterre_rows[region_col].unique().tolist() if len(digiterre_rows) > 0 else 'N/A'}")
+        debug_lines.append(f"✓ SFI rows: {len(sfi_rows)} → Region={sfi_rows[region_col].unique().tolist() if len(sfi_rows) > 0 else 'N/A'}")
+        debug_lines.append(f"✓ Europe rows (after override): {len(europe_rows)}")
+        debug_lines.append(f"  → Includes Digiterre: {('Digiterre' in europe_rows[client_col].values)}")
+        debug_lines.append(f"  → Includes SFI: {('SFI' in europe_rows[client_col].values)}")
+    
+    for line in debug_lines:
+        st.caption(line)
+
 months = get_available_months(cir_raw)
 selected_month = st.sidebar.selectbox("Select month for dashboard:", options=months,
                                       index=len(months) - 1, key="month_" + "_".join(months))
@@ -731,6 +765,10 @@ if prompt:
                     dynamic_context = generate_dynamic_context(
                         df_cir, df_res, metrics, cir_raw, selected_month, column_map, data_tables
                     )
+                    
+                    # Show what data is being sent to model
+                    with st.expander("📊 Data Tables Sent to Model"):
+                        st.code(data_tables, language="text")
                     hint = translate_vp_language(prompt)
                     hint_line = f"\nMetric terms detected in this question: {', '.join(hint)}." if hint else ""
 
