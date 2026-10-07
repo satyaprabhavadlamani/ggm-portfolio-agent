@@ -238,9 +238,9 @@ def validate_client_matching(df_cir, df_res, column_map, log=None, fuzzy_thresho
 
 def apply_region_overrides(df, column_map, data_type='cir'):
     """
-    Apply hardcoded region mappings for specific clients.
-    - Digiterre → Europe
-    - SFI → Europe
+    Apply hardcoded region mappings for specific clients AND regions.
+    - Digiterre (client OR region) → Europe
+    - SFI (client OR region) → Europe
     Ignores the source region/country and always uses the override.
     
     Args:
@@ -271,17 +271,22 @@ def apply_region_overrides(df, column_map, data_type='cir'):
     df = df.copy()
     
     # Apply region overrides for specific clients
-    # CRITICAL: These clients MUST always map to Europe regardless of source data
+    # CRITICAL: These MUST always map to Europe regardless of source data
     overrides = {
         'Digiterre': 'Europe',
         'SFI': 'Europe',
     }
     
-    for client_name, target_region in overrides.items():
-        # Robust matching: handle NaN, None, floats, case variations
-        mask = df[client_col].astype(str).str.strip().str.lower() == client_name.lower()
-        if mask.any():
-            df.loc[mask, region_col] = target_region
+    for override_name, target_region in overrides.items():
+        # Match in CLIENT column (handles Digiterre/SFI as client names)
+        client_mask = df[client_col].astype(str).str.strip().str.lower() == override_name.lower()
+        if client_mask.any():
+            df.loc[client_mask, region_col] = target_region
+        
+        # ALSO match in REGION column (handles Digiterre/SFI as region values in source data)
+        region_mask = df[region_col].astype(str).str.strip().str.lower() == override_name.lower()
+        if region_mask.any():
+            df.loc[region_mask, region_col] = target_region
     
     return df
 
@@ -455,6 +460,14 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month
         months_loaded = get_available_months(df_cir_raw)
         lines += [f"MONTHS LOADED: {', '.join(months_loaded)} ({year})", ""]
 
+    lines += ["CRITICAL CONTEXT:"]
+    lines += [f"- User has FILTERED to month: {selected_month}"]
+    lines += [f"- ALL answers MUST be for {selected_month} ONLY, UNLESS user explicitly asks for 'comparison' or 'vs previous/other month'"]
+    lines += [f"- If user asks 'what is revenue?', answer with {selected_month} revenue only"]
+    lines += [f"- If user asks 'compare August to July', THEN you may use Table 4 (across months)"]
+    lines += [f"- Default: Answer about {selected_month} unless otherwise asked"]
+    lines += [""]
+    
     lines += ["VP TERMINOLOGY:"]
     lines += [f"- {metric}: {', '.join(syns[:5])}" for metric, syns in SYNONYM_MAP.items()]
     lines += [""]
@@ -494,23 +507,23 @@ def get_groq_response(client, messages, models):
     return None, None, errors
 
 
-def suggest_questions(df_cir, column_map=None):
-    """Generate context-aware follow-up questions"""
+def suggest_questions(df_cir, column_map=None, selected_month=None):
+    """Generate context-aware follow-up questions for selected month"""
     suggestions = []
+    month_phrase = f"in {selected_month}" if selected_month else ""
 
-    if column_map and column_map.get('revenue'):
-        suggestions.append("📈 What's our revenue trend across months?")
     if column_map and column_map.get('client'):
-        suggestions.append("👥 Which client has the highest revenue?")
+        suggestions.append(f"👥 Which client has the highest revenue {month_phrase}?")
     if column_map and column_map.get('region'):
-        suggestions.append("🗺️ How does performance compare by region?")
+        suggestions.append(f"🗺️ What's the revenue breakdown by region {month_phrase}?")
     if column_map and column_map.get('gpm'):
-        suggestions.append("💰 Which accounts are most profitable?")
-
+        suggestions.append(f"💰 Which accounts are most profitable {month_phrase}?")
+    
+    # Add comparison question if data supports it
     suggestions.extend([
-        "📊 Show me a summary by account",
-        "🎯 What are our top 5 priorities?",
-        "⚠️ Which areas need improvement?",
+        f"📊 Revenue summary by client {month_phrase}",
+        f"📈 Compare {selected_month} to previous month" if selected_month else "📈 Compare months",
+        "🎯 Which region drives most revenue?",
     ])
     return suggestions[:5]
 
@@ -637,25 +650,29 @@ cir_raw, dropped_rows = clean_circle_df(cir_raw, column_map)
 cir_raw = apply_region_overrides(cir_raw, column_map, data_type='cir')
 res_raw = apply_region_overrides(res_raw, column_map, data_type='res')
 
-# Debug: Show status of region overrides
-with st.expander("🔍 DEBUG: Data Preparation Status"):
+# CRITICAL DATA VALIDATION - Show exactly what data is being used
+with st.expander("🔍 DATA VALIDATION - Exact Figures for Selected Month"):
     debug_lines = []
-    debug_lines.append(f"✓ Column mapping detected: client='{column_map.get('client')}', region='{column_map.get('region')}'")
-    debug_lines.append(f"✓ Data rows: Circle={len(cir_raw)}, Resource={len(res_raw)}")
+    debug_lines.append(f"✓ Columns: client='{column_map.get('client')}', region='{column_map.get('region')}', revenue='{column_map.get('revenue')}'")
+    debug_lines.append(f"✓ Filtering for Month = '{selected_month}'")
     
-    if 'Month' in cir_raw.columns and column_map.get('client') and column_map.get('region'):
-        client_col = column_map.get('client')
+    if 'Month' in cir_raw.columns:
+        selected_data = cir_raw[cir_raw['Month'].astype(str).str.strip() == selected_month]
+        debug_lines.append(f"✓ Rows in {selected_month}: {len(selected_data)} (from {len(cir_raw)} total)")
+        
+        rev_col = column_map.get('revenue')
         region_col = column_map.get('region')
         
-        digiterre_rows = cir_raw[cir_raw[client_col].astype(str).str.strip() == 'Digiterre']
-        sfi_rows = cir_raw[cir_raw[client_col].astype(str).str.strip() == 'SFI']
-        europe_rows = cir_raw[cir_raw[region_col].astype(str).str.strip() == 'Europe']
+        if rev_col and rev_col in selected_data.columns:
+            total_revenue = selected_data[rev_col].sum()
+            debug_lines.append(f"✓ Total {selected_month} Revenue: ${total_revenue:.3f}m")
         
-        debug_lines.append(f"✓ Digiterre rows: {len(digiterre_rows)} → Region={digiterre_rows[region_col].unique().tolist() if len(digiterre_rows) > 0 else 'N/A'}")
-        debug_lines.append(f"✓ SFI rows: {len(sfi_rows)} → Region={sfi_rows[region_col].unique().tolist() if len(sfi_rows) > 0 else 'N/A'}")
-        debug_lines.append(f"✓ Europe rows (after override): {len(europe_rows)}")
-        debug_lines.append(f"  → Includes Digiterre: {('Digiterre' in europe_rows[client_col].values)}")
-        debug_lines.append(f"  → Includes SFI: {('SFI' in europe_rows[client_col].values)}")
+        if region_col and region_col in selected_data.columns:
+            debug_lines.append(f"  Regions in {selected_month}:")
+            for reg in sorted(selected_data[region_col].unique()):
+                reg_rev = selected_data[selected_data[region_col].astype(str).str.strip() == str(reg)][rev_col].sum() if rev_col else 0
+                reg_count = len(selected_data[selected_data[region_col].astype(str).str.strip() == str(reg)])
+                debug_lines.append(f"    - {reg}: ${reg_rev:.3f}m ({reg_count} rows)")
     
     for line in debug_lines:
         st.caption(line)
@@ -750,9 +767,11 @@ with st.expander("📋 Detected columns & data checks"):
 
 st.divider()
 st.subheader("💬 Ask Questions")
+st.info(f"📍 **Context: All answers are for {selected_month} data by default.** Ask about trends, comparisons, or other months explicitly if needed.")
+st.caption(f"E.g., 'What is revenue?' = {selected_month} revenue | 'Compare to July' = month-over-month comparison")
 
 with st.expander("💡 Suggested questions"):
-    for idx, suggestion in enumerate(suggest_questions(df_cir, column_map), 1):
+    for idx, suggestion in enumerate(suggest_questions(df_cir, column_map, selected_month), 1):
         if st.button(suggestion, key=f"suggest_{idx}"):
             st.session_state.pending_prompt = suggestion
             st.rerun()
@@ -796,13 +815,18 @@ if prompt:
 
 RULES
 1. Answer ONLY from the snapshot and DATA TABLES above. Quote figures exactly as shown (USD millions; GPM as %).
-2. Do NOT calculate totals, averages, growth rates or rankings yourself. Use the pre-computed columns (e.g. Chg_pct) and the order the tables are sorted in. If a figure you need is not in the tables, say it is not available and name the data that would be needed.
-3. Do NOT assume, guess, or estimate any numbers. All figures must come directly from the tables. If you cannot find a number in the data, say "not available in the current data" rather than approximating or deriving unstated values.
-4. Translate VP wording to metrics (sales -> revenue, GP -> profit, margin -> GPM, team -> headcount, client/customer -> account).
-5. For questions about "clients in [region]" (e.g., "which clients are in Europe?"), use TABLE 4B (CLIENT-TO-REGION MAPPING) to identify relevant clients, then look up their revenue in TABLE 2 (BY CLIENT) or TABLE 4 (ACROSS MONTHS).
-6. Tables marked "top N of M" are truncated - make no claims about accounts that are not shown.
-7. Client names in the headcount data may be spelled differently from the financial data - flag a mismatch rather than guess.
-8. Be concise and executive-ready: lead with the answer, add 2-4 supporting points, finish with one suggested follow-up.{hint_line}"""
+2. MONTH FILTER RULE (CRITICAL): User has selected a specific month for analysis. Answer ALL questions for that selected month ONLY, UNLESS the user explicitly asks for "comparison", "vs", "change", or "previous month". Examples:
+   - Q: "What is our revenue?" → A: Revenue for selected month only
+   - Q: "Compare August to July" → A: Use Table 4 to show both months
+   - Q: "What changed from last month?" → A: Use Table 4 for month-over-month
+   Default: Single month analysis.
+3. Do NOT calculate totals, averages, growth rates or rankings yourself. Use the pre-computed columns (e.g. Chg_pct) and the order the tables are sorted in. If a figure you need is not in the tables, say it is not available and name the data that would be needed.
+4. Do NOT assume, guess, or estimate any numbers. All figures must come directly from the tables. If you cannot find a number in the data, say "not available in the current data" rather than approximating or deriving unstated values.
+5. Translate VP wording to metrics (sales -> revenue, GP -> profit, margin -> GPM, team -> headcount, client/customer -> account).
+6. For questions about "clients in [region]" (e.g., "which clients are in Europe?"), use TABLE 4B (CLIENT-TO-REGION MAPPING) to identify relevant clients, then look up their revenue in TABLE 2 (BY CLIENT) or TABLE 4 (ACROSS MONTHS).
+7. Tables marked "top N of M" are truncated - make no claims about accounts that are not shown.
+8. Client names in the headcount data may be spelled differently from the financial data - flag a mismatch rather than guess.
+9. Be concise and executive-ready: lead with the answer, add 2-4 supporting points, finish with one suggested follow-up.{hint_line}"""
 
                     history = [{"role": m["role"], "content": m["content"]}
                                for m in st.session_state.messages[-HISTORY_TURNS:]]
@@ -831,7 +855,7 @@ RULES
 
 if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
     st.caption("💡 **Next steps:**")
-    followups = suggest_questions(df_cir, column_map)[:3]
+    followups = suggest_questions(df_cir, column_map, selected_month)[:3]
     for idx, (col, suggestion) in enumerate(zip(st.columns(len(followups)), followups)):
         with col:
             if st.button(suggestion, key=f"followup_{idx}"):
