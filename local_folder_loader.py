@@ -151,6 +151,9 @@ def assign_months(df, report_month, label, log):
                 report_month = present[-1]
             if present != [report_month]:
                 log.append(f"{label}: file holds months {', '.join(present)} - the file's own Month column is used")
+            if report_month in MONTH_ORDER and report_month not in present:
+                log.append(f"⚠️ {label}: the file is named for {report_month} but has NO {report_month} rows "
+                           f"(latest month inside: {present[-1]})")
             return df
         log.append(f"{label}: 'Month' column not readable ({int(ok.sum())}/{len(df)} rows) - using file month {report_month}")
     df['Month'] = report_month
@@ -159,22 +162,41 @@ def assign_months(df, report_month, label, log):
 
 def select_authoritative(df):
     """
-    One month can sit in several files (the Aug file also holds Jan-Jul). The DEFAULT source
-    of a month is the file that REPORTS that month (August -> the August file). If no such
-    file is loaded, the earliest LATER file that contains it is used.
-    Returns (default_rows, other_rows). other_rows = same months found in the other files,
-    kept only so differences can be shown - they are never mixed into the default numbers.
+    One month can sit in several files (the Aug file also holds Jan-Jul).
+    DEFAULT source of a month:
+      1. the file that REPORTS that month (August -> the August file), if it holds rows for it;
+      2. otherwise the LATEST file that holds rows for it (a later sheet carries the corrected /
+         completed figures - this is also the sheet YTD is based on).
+    Returns (default_rows, other_rows). other_rows = same months found in the other files, kept only
+    so differences can be shown - they are never mixed into the default numbers.
     """
     if df is None or df.empty or not {'Month', REPORT_COL}.issubset(df.columns):
         return df, pd.DataFrame()
     idx = {m: i for i, m in enumerate(MONTH_ORDER)}
-    d = (df[REPORT_COL].map(idx) - df['Month'].map(idx)).fillna(0)     # 0 = same month, >0 = later file
-    rank = np.where(d == 0, 0, np.where(d > 0, d, 100 - d))
+    ri = df[REPORT_COL].map(idx)
+    d = (ri - df['Month'].map(idx)).fillna(0)                       # 0 = same month, >0 = later file
+    rank = np.where(d == 0, 0, np.where(d > 0, 1 + (11 - ri.fillna(0)), 100))   # later file = lower rank
     keys = [k for k in (YEAR_COL, 'Month') if k in df.columns]
     tmp = df.assign(_rank=rank)
     best = tmp.groupby(keys)['_rank'].transform('min')
     keep = (tmp['_rank'] == best).to_numpy()
     return df[keep].copy(), df[~keep].copy()
+
+
+def latest_file_view(df):
+    """
+    The 'revenue sheet' that YTD / QTD are based on: ALL rows of the LATEST file (highest report month,
+    per year) - its Sheet1 holds every month from Jan to its latest month.
+    """
+    if df is None or df.empty or REPORT_COL not in df.columns:
+        return df
+    idx = {m: i for i, m in enumerate(MONTH_ORDER)}
+    ri = df[REPORT_COL].map(idx)
+    if ri.isna().all():
+        return df
+    keys = [YEAR_COL] if YEAR_COL in df.columns else []
+    top = ri.groupby([df[k] for k in keys]).transform('max') if keys else ri.max()
+    return df[(ri == top).to_numpy()].copy()
 
 
 def month_mismatches(auth, other, revenue_col, cost_col=None, profit_col=None, client_col=None,

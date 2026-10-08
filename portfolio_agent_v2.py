@@ -34,9 +34,20 @@ from local_folder_loader import (
     get_available_months,
     infer_month_from_text,
     infer_year_from_text,
+    latest_file_view,
     load_monthly_data_from_folder,
     month_mismatches,
     select_authoritative,
+)
+from knowledge_base import (
+    PLAYBOOK_GUIDE,
+    SOURCE_REGION_COL,
+    build_report,
+    detect_period,
+    knowledge_text,
+    match_playbooks,
+    resolve_period,
+    verify_figures,
 )
 
 # ----------------------------------------------------------------------------
@@ -416,6 +427,11 @@ def apply_region_overrides(df, column_map, data_type='cir'):
     
     df = df.copy()
 
+    # Internal copy of the region as written in the source file. NOT shown in any table; only the
+    # knowledge-base per-region report uses it (the reference report lists Digiterre/SFI as regions).
+    if data_type == 'cir' and SOURCE_REGION_COL not in df.columns:
+        df[SOURCE_REGION_COL] = df[region_col]
+
     # Apply region overrides for specific clients
     # CRITICAL: These MUST always map to Europe regardless of source data
     overrides = {
@@ -607,8 +623,36 @@ def describe_sources(df):
     return "\n".join(f"- {a if a == b else a + '-' + b}: {f}" for a, f, b in runs)
 
 
+def _period_parts(period, column_map, top_n):
+    """TABLE P1-P3: totals / by region / by client for a YTD, QTD or quarter period, from the LATEST file's Sheet1."""
+    if not period or period.get("df") is None or period["df"].empty:
+        return []
+    sub = period["df"][period["df"]["Month"].isin(period["months"])]
+    if sub.empty:
+        return []
+    label = period["label"]
+    note = f"months {', '.join(period['months'])}" + (f"; NOT loaded: {', '.join(period['missing'])}" if period["missing"] else "")
+    out = []
+    tot = _agg(sub.assign(_Period=label), "_Period", column_map)
+    if not tot.empty:
+        out.append(f"TABLE P1 - {label} TOTAL ({note}; from the latest file's Sheet1)\n" + _csv(tot))
+    region, client = column_map.get("region"), column_map.get("client")
+    if region and region in sub.columns:
+        t = _agg(sub, region, column_map)
+        if not t.empty:
+            out.append(f"TABLE P2 - {label} BY REGION (all {len(t)})\n" +
+                       _csv(t.sort_values("Revenue_USDm" if "Revenue_USDm" in t.columns else t.columns[1], ascending=False)))
+    if client and client in sub.columns:
+        t = _agg(sub, client, column_map)
+        if not t.empty:
+            t = t.sort_values("Revenue_USDm" if "Revenue_USDm" in t.columns else t.columns[1], ascending=False)
+            scope = f"top {top_n} of {len(t)}" if len(t) > top_n else f"all {len(t)}"
+            out.append(f"TABLE P3 - {label} BY CLIENT ({scope}, sorted by revenue)\n" + _csv(t.head(top_n)))
+    return out
+
+
 def build_data_tables(df_cir_raw, df_res_raw, selected_month, column_map, top_n=TOP_N, extra_months=None,
-                      mismatches=None, multi_month=False):
+                      mismatches=None, multi_month=False, period=None):
     """All figures the model is allowed to quote, computed with pandas.
     extra_months: other loaded months named in the user's question - they get their own
     client / region / client-by-region / headcount tables so 'region revenue in July' is answerable."""
@@ -677,6 +721,9 @@ def build_data_tables(df_cir_raw, df_res_raw, selected_month, column_map, top_n=
         hc = _tables_headcount_month(df_res_raw[df_res_raw['Month'] == selected_month],
                                      selected_month, column_map, top_n)
         parts += [hc[k] for k in ('6', '7') if k in hc]
+
+    # YTD / QTD / quarter questions: computed from the latest file's Sheet1
+    parts += _period_parts(period, column_map, top_n)
 
     # Overall / YTD / comparison questions: every loaded month, each from its own default file
     if multi_month and len(months) > 1:
@@ -795,6 +842,8 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month
                 lines += [f"EUROPE REGION CLIENTS (for {selected_month}): {', '.join(sorted(europe_clients))}"]
                 lines += [""]
 
+    lines += [knowledge_text(), ""]
+
     if data_tables:
         lines += ["DATA TABLES (pre-computed with pandas - the only source for figures):", data_tables, ""]
 
@@ -825,7 +874,7 @@ RULES
 7. Tables marked "top N of M" are truncated - make no claims about accounts that are not shown.
 8. Headcount: "Active" excludes bench; bench is reported separately. Never add or mix them unless asked. Client names in the headcount data may be spelled differently from the financial data - flag a mismatch rather than guess.
 9. Be concise and executive-ready: lead with the answer, add 2-4 supporting points, finish with one suggested follow-up.
-10. SOURCES (CRITICAL): each month's default figures come from the file that reports that month (see DATA SOURCES) - e.g. August from the August file. A single-month question uses ONLY that month's default figures. Comparison / overall / YTD questions combine months using their own default figures (TABLES 1, 4, 8, 9). If a month is listed in TABLE M, its numbers differ between files: when comparing, state BOTH values separately, labelled by file (Default vs Other), say which one is the default, and never average or blend them. If a single-month question is about a month listed in TABLE M, add one short note.
+10. SOURCES (CRITICAL): each month's default figures come from the file that reports that month (see DATA SOURCES) - e.g. August from the August file. A single-month question uses ONLY that month's default figures. Comparison / overall questions combine months using their own default figures (TABLES 1, 4, 8, 9). YTD / QTD / quarter questions use TABLE P1-P3 (latest file's Sheet1) and the KNOWLEDGE BASE definitions. If a month is listed in TABLE M, its numbers differ between files: when comparing, state BOTH values separately, labelled by file (Default vs Other), say which one is the default, and never average or blend them. If a single-month question is about a month listed in TABLE M, add one short note.
 11. NAMES AND REGIONS: use client and region names exactly as written in the tables. Never add, rename, merge, group or infer clients, and never fill gaps from general knowledge. For a region, list only that region's rows from TABLE 4B. Say "top N" only when a table title says so; otherwise say how many rows the table has.{hint_line}"""
 
 
@@ -851,7 +900,8 @@ def assemble_prompt(df_cir, df_res, metrics, cir_raw, res_raw, selected_month, c
     base = 0
     for n in steps:
         tables = build_data_tables(cir_raw, res_raw, selected_month, column_map, top_n=n, extra_months=extra_months,
-                                   mismatches=extras.get('mismatches'), multi_month=extras.get('multi_month', False))
+                                   mismatches=extras.get('mismatches'), multi_month=extras.get('multi_month', False),
+                                   period=extras.get('period'))
         ctx = generate_dynamic_context(df_cir, df_res, metrics, cir_raw, selected_month, column_map, tables, extra_months,
                                        source_note=extras.get('source_note', ''))
         system_prompt = build_system_prompt(ctx, hint_line)
@@ -1083,6 +1133,8 @@ res_raw = apply_region_overrides(res_raw, column_map, data_type='res')
 
 # A monthly file also holds earlier months, so a month can appear in several files. Default = the file that
 # REPORTS the month (August -> the August file). Same month in other files is kept aside ONLY to show differences.
+# YTD / QTD are based on the LATEST file's Sheet1 (it holds every month from Jan to its latest month)
+cir_ytd = latest_file_view(cir_raw)
 cir_raw, cir_other = select_authoritative(cir_raw)
 res_raw, _res_other = select_authoritative(res_raw)
 mm_month, mm_client = month_mismatches(cir_raw, cir_other, column_map.get('revenue'), column_map.get('cost'),
@@ -1093,6 +1145,21 @@ months = get_available_months(cir_raw)
 selected_month = st.sidebar.selectbox("Select month for dashboard:", options=months,
                                       index=len(months) - 1, key=f"month_{selected_year}_" + "_".join(months))
 st.sidebar.success(f"✅ Data loaded - {f'{selected_year} ' if selected_year is not None else ''}months: {', '.join(months)}")
+
+# ---- Knowledge base context (reports are computed from these frames, no model involved) ----
+kb_cols = {"month": "Month", "client": column_map.get("client"), "region": column_map.get("region"),
+           "revenue": column_map.get("revenue"), "cost": column_map.get("cost"), "profit": column_map.get("profit")}
+kb_ready = all(kb_cols[k] for k in ("client", "region", "revenue", "profit"))
+kb_known = {"regions": set(), "clients": set()}
+if kb_ready:
+    _reg = [cir_raw[kb_cols["region"]]] + ([cir_ytd[SOURCE_REGION_COL]] if SOURCE_REGION_COL in cir_ytd.columns else [])
+    kb_known["regions"] = {str(x).strip().lower() for x in pd.concat(_reg).dropna().unique()}
+    kb_known["clients"] = {str(x).strip().lower() for x in cir_raw[kb_cols["client"]].dropna().unique()}
+_month_files = (cir_raw.groupby("Month")[SOURCE_COL].first().to_dict() if SOURCE_COL in cir_raw.columns else {})
+_ytd_file = (", ".join(sorted(cir_ytd[SOURCE_COL].astype(str).unique())) if SOURCE_COL in cir_ytd.columns else "")
+kb_ctx = {"ytd_df": cir_ytd, "month_df": cir_raw, "cols": kb_cols, "selected_month": selected_month,
+          "loaded_months": months, "mismatch": mm_month, "ytd_file": _ytd_file, "month_files": _month_files,
+          "known_clients": kb_known["clients"]}
 
 if mm_month is not None and not mm_month.empty:
     _pairs = sorted({f"{r.Month} ({r.Default_Source} vs {r.Other_Source})" for r in mm_month.itertuples()})
@@ -1247,6 +1314,21 @@ with st.expander("💡 Suggested questions"):
             st.session_state.pending_prompt = suggestion
             st.rerun()
 
+with st.expander("📚 Knowledge-base reports (computed directly from the data)"):
+    st.caption("YTD = Jan to the selected month · QTD = start of the selected month's quarter to the selected month "
+               "(quarters start in January) · YTD/QTD use the latest file's Sheet1 · GPM = GP / Revenue.")
+    for _id, _title, _example, _desc in PLAYBOOK_GUIDE:
+        st.markdown(f"**{_title}** - {_desc}  \n_e.g._ {_example}")
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        if st.button("Run YTD analysis", key="kb_run_ytd"):
+            st.session_state.pending_prompt = "YTD analysis"
+            st.rerun()
+    with _c2:
+        if st.button("Run QTD analysis", key="kb_run_qtd"):
+            st.session_state.pending_prompt = "QTD analysis"
+            st.rerun()
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -1262,7 +1344,21 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        if not groq_api_key:
+        kb_ids = match_playbooks(prompt, kb_known) if kb_ready else []
+        if kb_ids:
+            # Recognised report question: answered by code from the data, in the reference layout (no model)
+            try:
+                report = build_report(kb_ids, prompt, kb_ctx)
+                st.markdown(report["markdown"])
+                st.caption("📚 Knowledge base: " + ", ".join(kb_ids) +
+                           " · computed directly from the data (no model used) · same question = same layout")
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                st.session_state.messages.append({"role": "assistant", "content": report["markdown"]})
+            except Exception as e:
+                st.error(f"❌ Could not build the report: {e}  (your question was not saved - please resend it)")
+                with st.expander("Technical details"):
+                    st.code(traceback.format_exc())
+        elif not groq_api_key:
             st.error("❌ Groq API key not configured.")
         else:
             with st.spinner("🔍 Analyzing your question..."):
@@ -1283,7 +1379,12 @@ if prompt:
                         "mismatches": (mm_month, mm_client),
                         "multi_month": wants_multi_month(prompt, extra_months),
                         "source_note": source_note,
+                        "period": None,
                     }
+                    if detect_period(prompt):
+                        _p = resolve_period(prompt, selected_month, months)
+                        if _p["kind"] != "MONTH":
+                            extras["period"] = {**_p, "df": cir_ytd}
                     pr = assemble_prompt(df_cir, df_res, metrics, cir_raw, res_raw, selected_month, column_map,
                                          extra_months, history, hint_line, token_budget, extras)
                     messages = [{"role": "system", "content": pr["system_prompt"]}] + pr["history"]
@@ -1306,6 +1407,12 @@ if prompt:
                         st.session_state.messages.append({"role": "user", "content": prompt})
                         st.session_state.messages.append({"role": "assistant", "content": answer})
                         st.markdown(answer)
+                        unverified = verify_figures(answer, pr["system_prompt"])
+                        if unverified:
+                            st.warning("⚠️ These figures are not in the data tables sent to the model - please verify "
+                                       "before using them: " + ", ".join(unverified))
+                        else:
+                            st.caption("✅ Every decimal figure in this answer was found in the data tables.")
                         months_note = f" + {', '.join(extra_months)}" if extra_months else ""
                         src_files = (sorted(df_cir[SOURCE_COL].astype(str).unique())
                                      if SOURCE_COL in df_cir.columns else [])
