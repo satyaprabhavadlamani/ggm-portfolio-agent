@@ -65,8 +65,8 @@ WORKFORCE_GUIDE = [
     ("Headcount by dimension", "By account, country, region, tower, LOB, position or status", "headcount by account  |  employees by country"),
     ("Resources in an account", "Names, position, experience, location, status, skills, masked e-mail",
      "resources in ZS Associates  |  names of employees in Deloitte  |  employee details in Asian Development Bank"),
-    ("Top skills", "Top primary and secondary skills (each resource's first 4 listed skills) for bench, placed, an account or everyone",
-     "top skills among bench  |  top skills placed  |  skillset of ZS Associates"),
+    ("Top skills", "Top primary and secondary skills (each resource's first 4 listed skills) for bench, placed, one account, or every account side by side",
+     "top skills among bench  |  top skills placed  |  skillset of ZS Associates  |  top skills by client"),
     ("Bench", "Bench roster (names, skills) and bench skills", "bench resources  |  who is on bench"),
     ("Who has a skill", "Names of resources with a skill (primary or secondary)", "resources with Snowflake skill"),
     ("One person", "Full details of a named resource (name must match the data)", "details of <full name>"),
@@ -515,12 +515,42 @@ def sec_skill_tables(ctx, df, label, n, with_head=True):
     return "\n\n".join(out)
 
 
+_BY_ACCOUNT = re.compile(r"\b(by|per|each|every|across|for all)\s+(client|clients|account|accounts|customer|customers)\b|"
+                         r"\b(client|account|customer)[- ]?wise\b", re.I)
+
+
+def sec_skills_by_account(ctx, n):
+    """One row per account: how many resources and the skills most used there (first-4-skills rule applies)."""
+    s, cols = ctx["snap"], ctx["cols"]
+    client = cols["client"]
+
+    def cell(df, key):
+        c = cols.get(key)
+        if not c or c not in df.columns:
+            return "-"
+        t = top_skills(df, c, n)
+        return ", ".join(f"{r['Skill']} ({int(r['Resources'])})" for _, r in t.iterrows()) if len(t) else "-"
+
+    rows = []
+    for acc, d in s.groupby(client, sort=False):
+        rows.append((d["_emp"].nunique(), acc, d))
+    rows.sort(key=lambda x: (-x[0], str(x[1]).lower()))
+    body = [(a + (" (bench)" if d["_bench"].any() else ""), k, cell(d, "primary"), cell(d, "secondary")) for k, a, d in rows[:MAX_LIST_ROWS]]
+    return (_head(ctx, "Top skills by account") + "\n\n" +
+            md_table(["Account", "Resources", f"Top {n} primary skills (resources)", f"Top {n} secondary skills (resources)"], body) +
+            (f"\n\n_Showing {MAX_LIST_ROWS} of {len(rows)} accounts._" if len(rows) > MAX_LIST_ROWS else "") +
+            f"\n\n_Counts use each resource's first {TOP_SKILLS_FIRST_N} listed skills only. To go deeper into one account, "
+            f"name it, for example 'top skills in ZS Associates'._")
+
+
 def sec_top_skills(ctx, question, accounts):
     s, cols = ctx["snap"], ctx["cols"]
     mt = re.search(r"\btop\s*(\d{1,2})\b", question, re.I)
     n = int(mt.group(1)) if mt else TOP_SKILLS_N
     if accounts:
         return "\n\n".join(sec_skill_tables(ctx, s[s[cols["client"]] == a], a, n) for a in accounts)
+    if _BY_ACCOUNT.search(question):
+        return sec_skills_by_account(ctx, int(mt.group(1)) if mt else 5)
     if _BENCHW.search(question):
         return sec_skill_tables(ctx, s[s["_bench"]], "bench resources", n)
     if _PLACED.search(question):
