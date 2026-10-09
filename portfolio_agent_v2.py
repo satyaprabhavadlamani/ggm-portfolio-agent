@@ -39,6 +39,16 @@ from local_folder_loader import (
     month_mismatches,
     select_authoritative,
 )
+from workforce_kb import (
+    WORKFORCE_GUIDE,
+    build_workforce_report,
+    knowledge_text as wf_knowledge_text,
+    llm_tables as wf_llm_tables,
+    looks_workforce,
+    make_context as wf_make_context,
+    match_workforce,
+    resource_health,
+)
 from knowledge_base import (
     PLAYBOOK_GUIDE,
     SOURCE_REGION_COL,
@@ -652,7 +662,7 @@ def _period_parts(period, column_map, top_n):
 
 
 def build_data_tables(df_cir_raw, df_res_raw, selected_month, column_map, top_n=TOP_N, extra_months=None,
-                      mismatches=None, multi_month=False, period=None):
+                      mismatches=None, multi_month=False, period=None, workforce_fn=None):
     """All figures the model is allowed to quote, computed with pandas.
     extra_months: other loaded months named in the user's question - they get their own
     client / region / client-by-region / headcount tables so 'region revenue in July' is answerable."""
@@ -724,6 +734,10 @@ def build_data_tables(df_cir_raw, df_res_raw, selected_month, column_map, top_n=
 
     # YTD / QTD / quarter questions: computed from the latest file's Sheet1
     parts += _period_parts(period, column_map, top_n)
+
+    # Workforce questions: aggregated counts only (no names, employee numbers or e-mails ever reach the model)
+    if workforce_fn:
+        parts += workforce_fn(top_n)
 
     # Overall / YTD / comparison questions: every loaded month, each from its own default file
     if multi_month and len(months) > 1:
@@ -842,7 +856,7 @@ def generate_dynamic_context(df_cir, df_res, metrics, df_cir_raw, selected_month
                 lines += [f"EUROPE REGION CLIENTS (for {selected_month}): {', '.join(sorted(europe_clients))}"]
                 lines += [""]
 
-    lines += [knowledge_text(), ""]
+    lines += [knowledge_text(), "", wf_knowledge_text(), ""]
 
     if data_tables:
         lines += ["DATA TABLES (pre-computed with pandas - the only source for figures):", data_tables, ""]
@@ -875,7 +889,8 @@ RULES
 8. Headcount: "Active" excludes bench; bench is reported separately. Never add or mix them unless asked. Client names in the headcount data may be spelled differently from the financial data - flag a mismatch rather than guess.
 9. Be concise and executive-ready: lead with the answer, add 2-4 supporting points, finish with one suggested follow-up.
 10. SOURCES (CRITICAL): each month's default figures come from the file that reports that month (see DATA SOURCES) - e.g. August from the August file. A single-month question uses ONLY that month's default figures. Comparison / overall questions combine months using their own default figures (TABLES 1, 4, 8, 9). YTD / QTD / quarter questions use TABLE P1-P3 (latest file's Sheet1) and the KNOWLEDGE BASE definitions. If a month is listed in TABLE M, its numbers differ between files: when comparing, state BOTH values separately, labelled by file (Default vs Other), say which one is the default, and never average or blend them. If a single-month question is about a month listed in TABLE M, add one short note.
-11. NAMES AND REGIONS: use client and region names exactly as written in the tables. Never add, rename, merge, group or infer clients, and never fill gaps from general knowledge. For a region, list only that region's rows from TABLE 4B. Say "top N" only when a table title says so; otherwise say how many rows the table has.{hint_line}"""
+11. NAMES AND REGIONS: use client and region names exactly as written in the tables. Never add, rename, merge, group or infer clients, and never fill gaps from general knowledge. For a region, list only that region's rows from TABLE 4B. Say "top N" only when a table title says so; otherwise say how many rows the table has.
+12. WORKFORCE: use TABLE W1-W6 only (snapshot of the month, counts only). You are never given employee names, numbers or e-mails - never invent any; if asked for names or employee details say the knowledge-base reports answer these (for example "resources in <account>" or "top skills among bench"). Bench = accounts whose name contains 'bench'.{hint_line}"""
 
 
 def assemble_prompt(df_cir, df_res, metrics, cir_raw, res_raw, selected_month, column_map,
@@ -901,7 +916,7 @@ def assemble_prompt(df_cir, df_res, metrics, cir_raw, res_raw, selected_month, c
     for n in steps:
         tables = build_data_tables(cir_raw, res_raw, selected_month, column_map, top_n=n, extra_months=extra_months,
                                    mismatches=extras.get('mismatches'), multi_month=extras.get('multi_month', False),
-                                   period=extras.get('period'))
+                                   period=extras.get('period'), workforce_fn=extras.get('workforce_fn'))
         ctx = generate_dynamic_context(df_cir, df_res, metrics, cir_raw, selected_month, column_map, tables, extra_months,
                                        source_note=extras.get('source_note', ''))
         system_prompt = build_system_prompt(ctx, hint_line)
@@ -1280,6 +1295,9 @@ with st.expander("📋 Detected columns & data checks"):
         st.caption("Default source file per month:")
         for line in source_note.split("\n"):
             st.caption(line)
+    st.subheader("Workforce (resource) data")
+    for _l in resource_health(wf_make_context(res_raw, selected_month, "")):
+        st.caption(_l)
     st.subheader("Months that differ between files")
     if mm_month is not None and not mm_month.empty:
         st.caption("Default_* = file that reports the month (used by default). Other_* = same month in another file. USD m.")
@@ -1319,6 +1337,11 @@ with st.expander("📚 Knowledge-base reports (computed directly from the data)"
                "(quarters start in January) · YTD/QTD use the latest file's Sheet1 · GPM = GP / Revenue.")
     for _id, _title, _example, _desc in PLAYBOOK_GUIDE:
         st.markdown(f"**{_title}** - {_desc}  \n_e.g._ {_example}")
+    st.markdown("**Workforce (from the resource files - each file is a snapshot as on its month; compare uses the previous month's file)**")
+    for _t, _d, _e in WORKFORCE_GUIDE:
+        st.markdown(f"**{_t}** - {_d}  \n_e.g._ {_e}")
+    st.caption("Privacy: only employee names are shown. Employee numbers are never shown, e-mails are masked to 3 characters, "
+               "and no personal data is sent to the language model.")
     _c1, _c2 = st.columns(2)
     with _c1:
         if st.button("Run YTD analysis", key="kb_run_ytd"):
@@ -1344,8 +1367,23 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        kb_ids = match_playbooks(prompt, kb_known) if kb_ready else []
-        if kb_ids:
+        wctx = wf_make_context(res_raw, selected_month, prompt)
+        wf_ids = match_workforce(prompt, wctx["known"] if wctx.get("ok") else None)
+        kb_ids = [] if wf_ids else (match_playbooks(prompt, kb_known) if kb_ready else [])
+        if wf_ids:
+            # Workforce question: answered by code from the resource snapshot (no model, no personal data leaves the app)
+            try:
+                text = build_workforce_report(wf_ids, prompt, wctx)["markdown"] if wctx.get("ok") else "⚠️ " + wctx.get("why", "")
+                st.markdown(text)
+                st.caption("👥 Workforce knowledge base: " + ", ".join(wf_ids) +
+                           " · computed from the resource snapshot (no model used) · names only, e-mails masked")
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                st.session_state.messages.append({"role": "assistant", "content": text})
+            except Exception as e:
+                st.error(f"❌ Could not build the workforce report: {e}  (your question was not saved - please resend it)")
+                with st.expander("Technical details"):
+                    st.code(traceback.format_exc())
+        elif kb_ids:
             # Recognised report question: answered by code from the data, in the reference layout (no model)
             try:
                 report = build_report(kb_ids, prompt, kb_ctx)
@@ -1385,6 +1423,8 @@ if prompt:
                         _p = resolve_period(prompt, selected_month, months)
                         if _p["kind"] != "MONTH":
                             extras["period"] = {**_p, "df": cir_ytd}
+                    if wctx.get("ok") and looks_workforce(prompt):
+                        extras["workforce_fn"] = lambda n: wf_llm_tables(wctx, n)
                     pr = assemble_prompt(df_cir, df_res, metrics, cir_raw, res_raw, selected_month, column_map,
                                          extra_months, history, hint_line, token_budget, extras)
                     messages = [{"role": "system", "content": pr["system_prompt"]}] + pr["history"]
